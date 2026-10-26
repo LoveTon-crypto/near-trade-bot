@@ -1,0 +1,32 @@
+[Unit]
+Description=NEAR private trade bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/near-trade-bot
+ExecStart=/opt/near-trade-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+UMask=0077
+# изоляция процесса
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/near-trade-bot
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+# ключ не должен попадать в swap и дампы памяти
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
