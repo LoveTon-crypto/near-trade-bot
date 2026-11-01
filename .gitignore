@@ -1,0 +1,9 @@
+.env
+*.db
+*.db-*
+wallet.enc.json
+master.key
+venv/
+.ssh/
+__pycache__/
+*.pyc
