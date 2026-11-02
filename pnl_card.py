@@ -254,8 +254,9 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
         hw = d.textlength(hold, font=font(28))
         d.text((right - hw, y + 4), hold, font=font(28), fill=(200, 210, 230))
 
-    d.text((left, 640), "Referral Code", font=font(28), fill=(255, 255, 255))
-    d.text((left, 676), ref_code[:12], font=fit_font(d, ref_code[:12], right - left, 56), fill=(255, 255, 255))
+    if ref_code:  # теперь здесь юзернейм бота (@ndegen_bot), а не реферальный код
+        d.text((left, 640), "Trade on Telegram", font=font(28), fill=(255, 255, 255))
+        d.text((left, 676), ref_code[:20], font=fit_font(d, ref_code[:20], right - left, 56), fill=(255, 255, 255))
     pill(d, (left, 750, left + 230, 798), (26, 160, 255), r=14)
     text_c(d, left + 115, 758, "Trading Bot", font(28), (255, 255, 255))
 

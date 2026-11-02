@@ -1805,7 +1805,7 @@ async def build_pnl(bot_username: str, uid: int, s: Signer, token: str, hide: bo
     hold = hold_fmt(time.time() - pos["since"]) if pos["since"] else ""
     link = buy_link(bot_username, uid, tid)
     png = await asyncio.to_thread(pnl_card.render, sym or "?", pct, spent / YOCTO, worth / YOCTO, hold,
-                                  db.ref_code(uid), "NDBOT", hide, None, user_pics(uid),
+                                  f"@{bot_username}", "NDBOT", hide, None, user_pics(uid),
                                   db.get(f"u{uid}:pics_only", False), ("BOUGHT", "SOLD") if closed else ("INVESTED", "WORTH"))
     caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
                f"└ 🔗 {esc(link)}")
