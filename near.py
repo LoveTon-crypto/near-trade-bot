@@ -173,6 +173,10 @@ class Rpc:
         self.api_key = api_key
         self._rr = 0
         self._bench: dict[str, float] = {}  # url → до какого времени не использовать
+        # средняя скорость ответа узла (сек) и время последнего сбоя: чтения идут на самые быстрые узлы
+        self.lat: dict[str, float] = {}
+        self.fail_ts: dict[str, float] = {}
+        self.stats: dict[str, list[int]] = {u: [0, 0] for u in urls}  # url → [ок, сбоев]
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0),
                                       headers={"User-Agent": "near-trade-bot/1.0"})
 
@@ -187,41 +191,75 @@ class Rpc:
         return bool(name)  # HANDLER_ERROR / REQUEST_VALIDATION_ERROR — настоящий ответ NEAR
 
     def _order(self) -> list[str]:
+        """Сначала самые быстрые узлы; узел, который недавно сбоил (429/таймаут), — в конец на 60 сек.
+        Среди близких по скорости чередуем, чтобы не упираться в лимит одного узла."""
         now = time.time()
         live = [u for u in self.urls if self._bench.get(u, 0) < now] or list(self.urls)
-        self._rr = (self._rr + 1) % len(live)
-        return live[self._rr:] + live[:self._rr]
+        self._rr += 1
+        if self._rr % 15 == 0:  # изредка — по кругу, чтобы заново измерить скорость остальных узлов
+            k = (self._rr // 15) % len(live)
+            return live[k:] + live[:k]
+
+        def score(i_u):
+            i, u = i_u
+            sc = self.lat.get(u, 0.0)  # ещё не измеренный узел пробуем первым
+            if now - self.fail_ts.get(u, 0) < 60:
+                sc += 5
+            return sc + ((i + self._rr) % len(live)) * 0.03  # лёгкое чередование
+        return [u for _, u in sorted(enumerate(live), key=score)]
+
+    def _ok(self, url: str, dt: float):
+        self.lat[url] = dt if url not in self.lat else self.lat[url] * 0.7 + dt * 0.3
+        self.stats.setdefault(url, [0, 0])[0] += 1
+
+    def _bad(self, url: str):
+        self.fail_ts[url] = time.time()
+        self.stats.setdefault(url, [0, 0])[1] += 1
+
+    def report(self) -> list[tuple[str, float, int, int, bool]]:
+        now = time.time()
+        return [(u, self.lat.get(u, 0.0), *self.stats.get(u, [0, 0]), self._bench.get(u, 0) > now) for u in self.urls]
 
     async def call(self, method: str, params) -> dict:
         last = None
         for attempt in range(3):
             for url in self._order():
+                t0 = time.monotonic()
                 try:
+                    # чтения не ждём долго: зависший узел пропускаем через 4 сек; отправка транзакций — до 60 сек
+                    to = httpx.Timeout(4.0) if method == "query" else None
+                    kw = {"timeout": to} if to else {}
                     r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
-                                             headers=self._headers(url))
+                                             headers=self._headers(url), **kw)
                     data = r.json()
                 except (httpx.HTTPError, ValueError) as e:
                     last = e
+                    self._bad(url)
                     continue
                 if not isinstance(data, dict):
                     last = RpcError(f"{url}: bad response")
+                    self._bad(url)
                     continue
                 if "error" in data:
                     err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
                     if self._is_chain_error(err):
+                        self._ok(url, time.monotonic() - t0)
                         raise RpcError(json.dumps(err)[:800])
                     text = json.dumps(err)
                     if err.get("code") == -32601 or "discontinued" in text or "not exist" in text or r.status_code in (401, 403, 404):
                         self._bench[url] = time.time() + self.BENCH_SEC
                         log.warning("RPC %s benched: %s", url, text[:120])
                     last = RpcError(text[:300])
+                    self._bad(url)
                     continue
                 if "result" not in data:
                     if r.status_code in (401, 403, 404, 410) or "discontinued" in str(data):
                         self._bench[url] = time.time() + self.BENCH_SEC
                         log.warning("RPC %s benched: %s", url, str(data)[:120])
                     last = RpcError(f"{url}: {str(data)[:200]}")
+                    self._bad(url)
                     continue
+                self._ok(url, time.monotonic() - t0)
                 return data["result"]
             await asyncio.sleep(0.6 * (attempt + 1))
         raise RpcError(f"все RPC недоступны: {last}")

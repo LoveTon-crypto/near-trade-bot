@@ -731,8 +731,19 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
             return 0, 0
         return await asyncio.gather(ref.ft_balance(token, s.account_id), ref.native_balance(s.account_id))
 
-    meta, route, c, usd_near, (bal, near_bal) = await asyncio.gather(ref.ft_metadata(token), _route(), _mkt(),
-                                                                      near_usd(), _bals())
+    tm: dict[str, float] = {}
+    t_start = time.monotonic()
+
+    async def timed(name, coro):
+        t0 = time.monotonic()
+        try:
+            return await coro
+        finally:
+            tm[name] = time.monotonic() - t0
+
+    meta, route, c, usd_near, (bal, near_bal) = await asyncio.gather(
+        timed("meta", ref.ft_metadata(token)), timed("pool", _route()), timed("market+candles", _mkt()),
+        timed("near$", near_usd()), timed("balances", _bals()))
     sym, dec = str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0)
     tid = db.token_id(token, sym, dec)
     name = (c.name if c and c.name != "?" else meta.get("name")) or ""
@@ -811,10 +822,14 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     if c and len(c.candles) >= 3:
         if not c.symbol or c.symbol == "?":
             c.symbol = sym
+        t0 = time.monotonic()
         try:
             png = await asyncio.to_thread(market.render_chart, c)
         except Exception as e:
             log.info("chart %s: %s", token, e)
+        tm["render"] = time.monotonic() - t0
+    tm["total"] = time.monotonic() - t_start
+    log.info("card timing %s: %s", token, " ".join(f"{k}={v:.2f}s" for k, v in tm.items()))
     pr = presets(uid)
     kb = KB([
         [B(f"🟢 {a} Ⓝ", callback_data=f"b:{a}:{tid}") for a in pr[:4]],
@@ -861,10 +876,12 @@ async def send_card(uid: int, chat, token: str, edit_msg=None):
             if "not modified" not in str(e):
                 log.info("card edit: %s", e)
         return
+    t0 = time.monotonic()
     if png:
         await chat.send_photo(png, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
         await chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+    log.info("card timing %s: telegram send=%.2fs", token, time.monotonic() - t0)
 
 
 # ---------------------------------------------------------------- торговля
@@ -1720,6 +1737,17 @@ async def backup_job(ctx: ContextTypes.DEFAULT_TYPE):
         await send_backup(ctx.bot, ADMIN_IDS)
     else:
         log.warning("backup: ADMIN_IDS не задан — бэкап некому отправить")
+
+
+async def cmd_rpc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Скорость RPC-узлов (для админа): средний ответ, успешных/сбоев, исключён ли узел."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    rows = sorted(rpc.report(), key=lambda r: (r[4], r[1] or 99))
+    lines = ["🛰 <b>RPC</b>"] + [
+        f"{'⛔' if benched else '🟢' if lat and lat < 0.6 else '🟡'} <code>{esc(u.split('//')[-1][:32])}</code> · "
+        f"{lat:.2f}s · ok {ok} · err {err}" for u, lat, ok, err, benched in rows]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2733,6 +2761,7 @@ def main():
     app.add_handler(CommandHandler("ref", show_ref))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("rpc", cmd_rpc))
     app.add_handler(CallbackQueryHandler(on_ref_cb, pattern=r"^rf:"))
     app.add_handler(CallbackQueryHandler(on_pnl_share, pattern=r"^pn:"))
     app.add_handler(CallbackQueryHandler(on_order_cb, pattern=r"^lo:"))

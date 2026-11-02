@@ -153,8 +153,12 @@ class Scanner:
         self.px_hist = None   # (token, since_ts) -> [(ts, price)]
 
     async def _json(self, method: str, url: str, **kw):
+        t0 = time.monotonic()
         try:
             r = await self.client.request(method, url, **kw)
+            dt = time.monotonic() - t0
+            if dt > 0.7:
+                log.info("slow HTTP %.2fs %s", dt, url.split("?")[0][:90])
             if r.status_code >= 400:
                 log.info("HTTP %s %s", r.status_code, url)
                 return None
