@@ -862,8 +862,8 @@ def order_cond(side: str, mode: str) -> str:
 
 def mode_label(side: str, mode: str) -> str:
     if mode == "basic":
-        return "⚪ Базовые" if side == "buy" else "⚪ Тейк-профит"
-    return "🚀 Пробой" if side == "buy" else "🛑 Стоп-лосс"
+        return "⚪ Лимит на просадке (−%)" if side == "buy" else "⚪ Тейк-профит (+%)"
+    return "🚀 Покупка на пробое (+%)" if side == "buy" else "🛑 Стоп-лосс (−%)"
 
 
 def fmt_unit(unit: str, v: float) -> str:
@@ -1060,6 +1060,7 @@ async def on_order_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Обновлено")
     elif act == "side":
         d["side"] = "sell" if d["side"] == "buy" else "buy"
+        d["mode"] = "basic"  # по умолчанию: покупка на просадке (−%), продажа в плюс (+%)
         d["value"] = None  # направление цели меняется — цену задаём заново
         await q.answer()
     elif act == "mode":
