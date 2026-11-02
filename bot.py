@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from telegram import (CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup,
                       Update)
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB
-from telegram.constants import ParseMode, ChatType
+from telegram.constants import ParseMode, ChatType, ChatAction
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
                           ContextTypes, ExtBot, MessageHandler, TypeHandler, filters)
 
@@ -840,6 +840,13 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
         + ([B("📤 Поделиться PnL", callback_data=f"pn:{tid}")] if has_pos else []),
     ])
     return "\n".join(lines), kb, png
+
+
+async def _typing(chat):
+    try:
+        await chat.send_action(ChatAction.UPLOAD_PHOTO)
+    except Exception:
+        pass
 
 
 def find_token(text: str) -> str | None:
@@ -2699,6 +2706,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     token = find_token(text)
     if token:
+        asyncio.create_task(_typing(update.effective_chat))  # «отправляет фото…» сразу, пока собирается карточка
         await send_card(uid, update.effective_chat, token)
     else:
         await update.message.reply_text("Отправьте адрес токена (например, batman-4.nearlytrade.near) или ссылку на него.",

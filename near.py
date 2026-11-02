@@ -220,47 +220,69 @@ class Rpc:
         now = time.time()
         return [(u, self.lat.get(u, 0.0), *self.stats.get(u, [0, 0]), self._bench.get(u, 0) > now) for u in self.urls]
 
+    HEDGE_SEC = 0.35  # чтение: если узел молчит дольше — параллельно спрашиваем следующий, берём первый ответ
+
+    async def _one(self, url: str, method: str, params) -> tuple[str, object]:
+        """Один запрос к одному узлу → ("ok", result) | ("chain", RpcError — настоящий ответ NEAR) | ("fail", ошибка)."""
+        t0 = time.monotonic()
+        try:
+            # чтения не ждём долго: зависший узел пропускаем через 4 сек; отправка транзакций — до 60 сек
+            kw = {"timeout": httpx.Timeout(4.0)} if method == "query" else {}
+            r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
+                                     headers=self._headers(url), **kw)
+            data = r.json()
+        except (httpx.HTTPError, ValueError) as e:
+            self._bad(url)
+            return "fail", e
+        if not isinstance(data, dict):
+            self._bad(url)
+            return "fail", RpcError(f"{url}: bad response")
+        if "error" in data:
+            err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
+            if self._is_chain_error(err):
+                self._ok(url, time.monotonic() - t0)
+                return "chain", RpcError(json.dumps(err)[:800])
+            text = json.dumps(err)
+            if err.get("code") == -32601 or "discontinued" in text or "not exist" in text or r.status_code in (401, 403, 404):
+                self._bench[url] = time.time() + self.BENCH_SEC
+                log.warning("RPC %s benched: %s", url, text[:120])
+            self._bad(url)
+            return "fail", RpcError(text[:300])
+        if "result" not in data:
+            if r.status_code in (401, 403, 404, 410) or "discontinued" in str(data):
+                self._bench[url] = time.time() + self.BENCH_SEC
+                log.warning("RPC %s benched: %s", url, str(data)[:120])
+            self._bad(url)
+            return "fail", RpcError(f"{url}: {str(data)[:200]}")
+        self._ok(url, time.monotonic() - t0)
+        return "ok", data["result"]
+
     async def call(self, method: str, params) -> dict:
         last = None
+        hedge = method == "query"  # чтения безопасно дублировать; транзакции — никогда
         for attempt in range(3):
-            for url in self._order():
-                t0 = time.monotonic()
-                try:
-                    # чтения не ждём долго: зависший узел пропускаем через 4 сек; отправка транзакций — до 60 сек
-                    to = httpx.Timeout(4.0) if method == "query" else None
-                    kw = {"timeout": to} if to else {}
-                    r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
-                                             headers=self._headers(url), **kw)
-                    data = r.json()
-                except (httpx.HTTPError, ValueError) as e:
-                    last = e
-                    self._bad(url)
-                    continue
-                if not isinstance(data, dict):
-                    last = RpcError(f"{url}: bad response")
-                    self._bad(url)
-                    continue
-                if "error" in data:
-                    err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
-                    if self._is_chain_error(err):
-                        self._ok(url, time.monotonic() - t0)
-                        raise RpcError(json.dumps(err)[:800])
-                    text = json.dumps(err)
-                    if err.get("code") == -32601 or "discontinued" in text or "not exist" in text or r.status_code in (401, 403, 404):
-                        self._bench[url] = time.time() + self.BENCH_SEC
-                        log.warning("RPC %s benched: %s", url, text[:120])
-                    last = RpcError(text[:300])
-                    self._bad(url)
-                    continue
-                if "result" not in data:
-                    if r.status_code in (401, 403, 404, 410) or "discontinued" in str(data):
-                        self._bench[url] = time.time() + self.BENCH_SEC
-                        log.warning("RPC %s benched: %s", url, str(data)[:120])
-                    last = RpcError(f"{url}: {str(data)[:200]}")
-                    self._bad(url)
-                    continue
-                self._ok(url, time.monotonic() - t0)
-                return data["result"]
+            urls = self._order()
+            pending: set[asyncio.Task] = set()
+            try:
+                i = 0
+                while i < len(urls) or pending:
+                    if i < len(urls) and (not pending or hedge):
+                        pending.add(asyncio.create_task(self._one(urls[i], method, params)))
+                        i += 1
+                    wait = self.HEDGE_SEC if hedge and i < len(urls) else None
+                    done, pending = await asyncio.wait(pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        kind, val = t.result()
+                        if kind == "ok":
+                            return val
+                        if kind == "chain":
+                            raise val
+                        last = val
+                    if not done and not hedge:
+                        continue
+            finally:
+                for t in pending:
+                    t.cancel()
             await asyncio.sleep(0.6 * (attempt + 1))
         raise RpcError(f"все RPC недоступны: {last}")
 
