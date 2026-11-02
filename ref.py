@@ -156,11 +156,13 @@ class Ref:
         for pid, p in zip(ids, infos):
             if not p or {p.get("token_x"), p.get("token_y")} != {token, WNEAR}:
                 continue
-            wn = self._reserve(p, WNEAR)
-            if wn > 0 and (best is None or wn > best[1]):
-                best = (pid, wn)
+            wn, tok = self._reserve(p, WNEAR), self._reserve(p, token)
+            # свежий пул мемпада односторонний: весь саплай токена и 0 wNEAR — купить в нём уже можно
+            if (wn > 0 or tok > 0) and (best is None or (wn, tok) > best[2]):
+                best = (pid, wn, (wn, tok))
         if not best:
             raise NoPool(token)
+        best = best[:2]
         return best
 
     async def dcl_two_hop(self, token: str) -> Route:

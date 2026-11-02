@@ -102,8 +102,8 @@ EN: dict[str, str] = {
 
     # token card / trading
     "% за 24ч": "% 24h", "💲 Цена: <b>": "💲 Price: <b>", "🔀 Пул: ": "🔀 Pool: ", "📊 Объём 24ч: ": "📊 Volume 24h: ", " · сделок ": " · trades ",
-    "⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.":
-        "⚠️ No NEAR pool on Ref or Ref DCL. JustHoot tokens before migration aren't supported yet.",
+    "⚠️ Пула с NEAR пока нет ни на Ref, ни на Ref DCL — купить токен пока нельзя.":
+        "⚠️ No NEAR pool on Ref or Ref DCL yet — the token can't be bought yet.",
     "👛 У вас: <b>": "👛 You hold: <b>", "📥 Вложено: <b>": "📥 Invested: <b>", "💰 Текущая стоимость: <b>": "💰 Current value: <b>",
     " Ⓝ · ⚙️ слиппедж ": " Ⓝ · ⚙️ slippage ", "📋 Лимит-ордер": "📋 Limit order", "🔄 Обновить": "🔄 Refresh",
     "⏳ Сеть NEAR сейчас перегружена запросами, карточка не загрузилась. Нажмите «Обновить» через пару секунд.":
@@ -362,7 +362,7 @@ EN: dict[str, str] = {
 }
 
 # служебные строки разбора ввода — не переводятся
-NOT_UI = {"к", "м", "kк", "всё", "все", "все RPC"}
+NOT_UI = {"к", "м", "kк", "всё", "все", "все RPC", "большой storage"}
 
 _RX = re.compile("|".join(re.escape(k) for k in sorted(EN, key=len, reverse=True)))
 _REV = {v: k for k, v in EN.items()}

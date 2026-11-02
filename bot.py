@@ -796,7 +796,7 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     if route:
         lines.append(f"🔀 Пул: {esc(route.label)}")
     else:
-        lines.append("⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.")
+        lines.append("⚠️ Пула с NEAR пока нет ни на Ref, ни на Ref DCL — купить токен пока нельзя.")
 
     has_pos = False
     if s:
