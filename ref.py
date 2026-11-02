@@ -8,18 +8,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 
 from near import Rpc, Signer, FunctionCall, TGAS, ONE_YOCTO, YOCTO, TxFailed
 
 log = logging.getLogger("ref")
 
 REF = "v2.ref-finance.near"
+DCL = "dclv2.ref-labs.near"           # Ref DCL (concentrated liquidity): здесь торгуются токены nearly.trade
+DCL_FEES = (10000, 2000, 400, 100)     # nearly.trade запускает токены в пул с комиссией 1% (10000)
 WNEAR = "wrap.near"
 DEFAULT_STORAGE = 1_250_000_000_000_000_000_000  # 0.00125 NEAR
 
 
 class NoPool(Exception):
     pass
+
+
+@dataclass
+class Route:
+    """Где торговать токеном: классический пул Ref (pool_id int) или пул DCL (pool_id 'a|b|fee')."""
+    kind: str        # "ref" | "dcl"
+    pool_id: object
+    wnear: int       # резерв wNEAR в пуле (yocto)
+
+    @property
+    def label(self) -> str:
+        return f"Ref #{self.pool_id}" if self.kind == "ref" else f"Ref DCL {int(str(self.pool_id).split('|')[2]) / 10000:g}%"
 
 
 class Ref:
@@ -71,6 +86,55 @@ class Ref:
         r = await self.rpc.view(REF, "get_return", {"pool_id": pool_id, "token_in": token_in,
                                                      "amount_in": str(amount_in), "token_out": token_out})
         return int(r)
+
+    async def dcl_pool(self, token: str) -> tuple[str, int]:
+        """(pool_id, резерв wNEAR) лучшего пула DCL token/wNEAR. Состав пула проверяется в самом контракте."""
+        best = None
+        a, b = sorted([token, WNEAR])  # в DCL токены в id пула идут по алфавиту; обратный порядок — на всякий случай
+        for pid in [f"{x}|{y}|{fee}" for fee in DCL_FEES for x, y in ((a, b), (b, a))]:
+            try:
+                p = await self.rpc.view(DCL, "get_pool", {"pool_id": pid})
+            except Exception:
+                p = None
+            if not p or {p.get("token_x"), p.get("token_y")} != {token, WNEAR}:
+                continue
+            if str(p.get("state", "Running")).lower() not in ("running", ""):
+                continue
+            wn = int(p.get("total_x") if p.get("token_x") == WNEAR else p.get("total_y") or 0)
+            if wn > 0 and (best is None or wn > best[1]):
+                best = (pid, wn)
+        if not best:
+            raise NoPool(token)
+        return best
+
+    async def route(self, token: str) -> Route:
+        """Пул с наибольшей ликвидностью wNEAR: классический Ref или DCL."""
+        cands = []
+        try:
+            pid, wn = await self.best_pool(token)
+            cands.append(Route("ref", pid, wn))
+        except NoPool:
+            pass
+        try:
+            pid, wn = await self.dcl_pool(token)
+            cands.append(Route("dcl", pid, wn))
+        except NoPool:
+            pass
+        if not cands:
+            raise NoPool(token)
+        return max(cands, key=lambda r: r.wnear)
+
+    async def quote_route(self, r: Route, token_in: str, amount_in: int, token_out: str) -> int:
+        if r.kind == "ref":
+            return await self.quote(r.pool_id, token_in, amount_in, token_out)
+        q = await self.rpc.view(DCL, "quote", {"pool_ids": [r.pool_id], "input_token": token_in,
+                                               "output_token": token_out, "input_amount": str(amount_in)})
+        return int((q or {}).get("amount") or 0)
+
+    @staticmethod
+    def _dcl_msg(pool_id: str, token_out: str, min_out: int) -> str:
+        return json.dumps({"Swap": {"pool_ids": [pool_id], "output_token": token_out,
+                                    "min_output_amount": str(min_out)}}, separators=(",", ":"))
 
     # ------------------------------------------------------------ балансы и storage
     async def ft_balance(self, token: str, account: str) -> int:
@@ -130,9 +194,18 @@ class Ref:
         if w > 0:
             await s.send(WNEAR, [FunctionCall("near_withdraw", {"amount": str(w)}, gas=10 * TGAS, deposit=ONE_YOCTO)])
 
+    def _swap_call(self, r: Route, token_in: str, token_out: str, amount: int, min_out: int) -> FunctionCall:
+        if r.kind == "ref":
+            to, msg = REF, self._msg(r.pool_id, token_in, token_out, amount, min_out)
+        else:
+            to, msg = DCL, self._dcl_msg(r.pool_id, token_out, min_out)
+        return FunctionCall("ft_transfer_call", {"receiver_id": to, "amount": str(amount), "msg": msg},
+                            gas=180 * TGAS, deposit=ONE_YOCTO)
+
     async def buy(self, s: Signer, token: str, near_in: int, slippage_bps: int) -> dict:
-        pool_id, _ = await self.best_pool(token)
-        expected = await self.quote(pool_id, WNEAR, near_in, token)
+        r = await self.route(token)
+        pool_id = r.pool_id
+        expected = await self.quote_route(r, WNEAR, near_in, token)
         if expected <= 0:
             raise TxFailed("котировка 0 — в пуле нет ликвидности")
         min_out = expected * (10_000 - slippage_bps) // 10_000
@@ -142,9 +215,7 @@ class Ref:
         try:
             res = await s.send(WNEAR, [
                 FunctionCall("near_deposit", {}, gas=10 * TGAS, deposit=near_in),
-                FunctionCall("ft_transfer_call", {"receiver_id": REF, "amount": str(near_in),
-                                                  "msg": self._msg(pool_id, WNEAR, token, near_in, min_out)},
-                             gas=180 * TGAS, deposit=ONE_YOCTO),
+                self._swap_call(r, WNEAR, token, near_in, min_out),
             ])
         finally:
             # при неудачном свапе wNEAR возвращается на кошелёк — разворачиваем обратно в NEAR
@@ -157,20 +228,19 @@ class Ref:
         got = await self.ft_balance(token, s.account_id) - before
         if got <= 0:
             raise TxFailed("свап не дал токенов (возможно, слиппедж). NEAR возвращён.", res.get("_hash"))
-        return {"pool_id": pool_id, "got": got, "expected": expected, "spent": near_in, "hash": res["_hash"]}
+        return {"pool_id": pool_id, "route": r, "got": got, "expected": expected, "spent": near_in, "hash": res["_hash"]}
 
     async def sell(self, s: Signer, token: str, amount: int, slippage_bps: int) -> dict:
-        pool_id, _ = await self.best_pool(token)
-        expected = await self.quote(pool_id, token, amount, WNEAR)
+        r = await self.route(token)
+        pool_id = r.pool_id
+        expected = await self.quote_route(r, token, amount, WNEAR)
         if expected <= 0:
             raise TxFailed("котировка 0 — в пуле нет ликвидности")
         min_out = expected * (10_000 - slippage_bps) // 10_000
         await self.ensure_storage(s, WNEAR)
         nat0 = await self.native_balance(s.account_id)
         w0 = await self.ft_balance(WNEAR, s.account_id)
-        res = await s.send(token, [FunctionCall("ft_transfer_call", {
-            "receiver_id": REF, "amount": str(amount),
-            "msg": self._msg(pool_id, token, WNEAR, amount, min_out)}, gas=180 * TGAS, deposit=ONE_YOCTO)])
+        res = await s.send(token, [self._swap_call(r, token, WNEAR, amount, min_out)])
         burnt = self._burnt(res)
         await self._collect_ref_deposit(s, WNEAR)
         w1 = await self.ft_balance(WNEAR, s.account_id)
@@ -181,7 +251,7 @@ class Ref:
             await self.unwrap_all(s)
         except Exception as e:
             log.warning("unwrap after sell failed: %s", e)
-        return {"pool_id": pool_id, "got": max(got, 0), "expected": expected, "sold": amount, "hash": res["_hash"]}
+        return {"pool_id": pool_id, "route": r, "got": max(got, 0), "expected": expected, "sold": amount, "hash": res["_hash"]}
 
     async def withdraw_near(self, s: Signer, to: str, amount: int) -> dict:
         from near import Transfer

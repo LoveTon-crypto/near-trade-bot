@@ -472,30 +472,31 @@ async def token_card(uid: int, token: str) -> tuple[str, KB]:
     sym, dec = str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0)
     tid = db.token_id(token, sym, dec)
     lines = [f"<b>${esc(sym)}</b> · {esc(str(meta.get('name') or '')[:40])}", f"<code>{esc(token)}</code>", ""]
+    route = None
     try:
-        pool_id, wn = await ref.best_pool(token)
-        p = await rpc.view("v2.ref-finance.near", "get_pool", {"pool_id": pool_id})
-        toks, amts = p["token_account_ids"], [int(a) for a in p["amounts"]]
-        tr = amts[1 - toks.index(WNEAR)]
-        price = (wn / YOCTO) / (tr / 10 ** dec) if tr else 0
-        lines.append(f"💲 Цена: <b>{price:.10g} NEAR</b>")
-        lines.append(f"💧 Ликвидность: {fmt_near(wn * 2, 1)} NEAR · пул Ref #{pool_id}")
+        route = await ref.route(token)
+        probe = YOCTO // 10  # цена по котировке 0.1 NEAR (с учётом комиссии пула)
+        out = await ref.quote_route(route, WNEAR, probe, token)
+        price = (probe / YOCTO) / (out / 10 ** dec) if out else 0
+        lines.append(f"💲 Цена: <b>≈{price:.6g} NEAR</b>")
+        lines.append(f"💧 Ликвидность: {fmt_near(route.wnear * 2, 1)} NEAR · {esc(route.label)}")
     except NoPool:
-        lines.append("⚠️ Пула с NEAR на Ref нет. Если токен ещё на мемпаде — покупка там будет на следующем этапе.")
+        lines.append("⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.")
     s = active_signer(uid)
     if s:
         bal = await ref.ft_balance(token, s.account_id)
         if bal:
             line = f"👛 У вас: <b>{fmt_tok(bal, dec)} {esc(sym)}</b>"
             try:
-                pid, _ = await ref.best_pool(token)
-                val = await ref.quote(pid, token, bal, WNEAR)
+                if not route:
+                    raise NoPool(token)
+                val = await ref.quote_route(route, token, bal, WNEAR)
                 spent, got = db.totals(s.account_id, token)
                 line += f" ≈ {fmt_near(val)} NEAR"
                 if spent:
                     pnl = got + val - spent
                     line += f"\n📈 PnL: <b>{'+' if pnl >= 0 else '−'}{fmt_near(abs(pnl))} NEAR</b> ({pnl / spent * 100:+.1f}%)"
-            except NoPool:
+            except (NoPool, RpcError):
                 pass
             lines.append(line)
         lines.append(f"\n👛 {esc(short(s.account_id))} · баланс {fmt_near(await ref.native_balance(s.account_id))} NEAR")
@@ -560,7 +561,7 @@ async def do_buy(uid: int, s: Signer, chat, token: str, amount: int):
                             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         await send_card(uid, chat, token)
     except NoPool:
-        await msg.edit_text("❌ Нет пула с NEAR на Ref для этого токена.")
+        await msg.edit_text("❌ Нет пула с NEAR ни на Ref, ни на Ref DCL для этого токена.")
     except (TxFailed, RpcError) as e:
         h = f" · {nb_tx(e.tx_hash)}" if isinstance(e, TxFailed) and e.tx_hash else ""
         await msg.edit_text(f"❌ Покупка не прошла: {esc(str(e)[:300])}{h}", parse_mode=ParseMode.HTML,
@@ -588,7 +589,7 @@ async def do_sell(uid: int, s: Signer, chat, token: str, pct: Decimal):
                             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         await send_card(uid, chat, token)
     except NoPool:
-        await msg.edit_text("❌ Нет пула с NEAR на Ref для этого токена.")
+        await msg.edit_text("❌ Нет пула с NEAR ни на Ref, ни на Ref DCL для этого токена.")
     except (TxFailed, RpcError) as e:
         h = f" · {nb_tx(e.tx_hash)}" if isinstance(e, TxFailed) and e.tx_hash else ""
         await msg.edit_text(f"❌ Продажа не прошла: {esc(str(e)[:300])}{h}", parse_mode=ParseMode.HTML,
@@ -646,8 +647,7 @@ async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, sym, dec = db.token_by_id(tid)
         spent, got = db.totals(acc, token)
         try:
-            pid, _ = await ref.best_pool(token)
-            val = await ref.quote(pid, token, bal, WNEAR)
+            val = await ref.quote_route(await ref.route(token), token, bal, WNEAR)
         except (NoPool, RpcError):
             val = 0
         pnl = got + val - spent
