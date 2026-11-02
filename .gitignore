@@ -7,3 +7,4 @@ venv/
 .ssh/
 __pycache__/
 *.pyc
+.mpl/

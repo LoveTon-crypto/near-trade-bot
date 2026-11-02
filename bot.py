@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import os
@@ -13,8 +14,8 @@ import time
 from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
-from telegram import (CopyTextButton, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, ReplyKeyboardMarkup,
-                      Update)
+from telegram import (CopyTextButton, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, InputMediaPhoto,
+                      ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, TypeHandler, filters)
@@ -22,6 +23,7 @@ from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHand
 load_dotenv()
 
 from db import DB
+import market
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
 import wallets
@@ -49,6 +51,7 @@ db = DB(os.getenv("DB_PATH", "trade.db"))
 rpc = Rpc(RPC_URLS, FASTNEAR_API_KEY)
 ref = Ref(rpc)
 vault = Vault(wallets.load_master_key())
+scanner = market.Scanner(rpc)
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
@@ -469,50 +472,126 @@ async def on_transfer_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------- карточка токена
-async def token_card(uid: int, token: str) -> tuple[str, KB]:
+def k_usd(x: float) -> str:
+    x = float(x or 0)
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(x) >= div:
+            return f"${x / div:.2f}{suf}"
+    return f"${x:,.2f}"
+
+
+def near_px(x: float) -> str:
+    """Цена в NEAR с «маленькими нулями», как в сканерах: 0.0₄1314."""
+    return market.price_fmt(x)[1:] if x else "0"
+
+
+async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     meta = await ref.ft_metadata(token)
     sym, dec = str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0)
     tid = db.token_id(token, sym, dec)
-    lines = [f"<b>${esc(sym)}</b> · {esc(str(meta.get('name') or '')[:40])}", f"<code>{esc(token)}</code>", ""]
-    route = None
-    try:
-        route = await ref.route(token)
+
+    async def _route():
+        try:
+            return await ref.route(token)
+        except NoPool:
+            return None
+
+    async def _mkt():
+        try:
+            return await scanner.card(token, with_chart=True, with_holders=False)
+        except Exception as e:
+            log.info("market %s: %s", token, e)
+            return None
+
+    route, c, usd_near = await asyncio.gather(_route(), _mkt(), near_usd())
+    name = (c.name if c and c.name != "?" else meta.get("name")) or ""
+    ch = (c.chg.get("h24") if c else None)
+    head = f"<b>${esc(sym)}</b> · {esc(str(name)[:32])}"
+    if ch is not None:
+        head += f" | {'🟢' if ch >= 0 else '🔴'} {ch:+.2f}%"
+    lines = [head, f"<code>{esc(token)}</code>"]
+    pad = "nearly" if token.endswith(".nearlytrade.near") else ("justhoot" if "justhoot" in token else "")
+    links = [f'<a href="https://dexscreener.com/near/{esc(token)}">DS</a>',
+             f'<a href="https://nearblocks.io/token/{esc(token)}">Nearblocks</a>']
+    if pad == "nearly":
+        links.append(f'<a href="https://nearly.trade/{esc(token)}">Nearly</a>')
+    elif pad == "justhoot":
+        links.append(f'<a href="https://justhoot.fun/p/{esc(token)}">JustHoot</a>')
+    lines.append("└ " + " | ".join(links))
+    lines.append("")
+
+    price_usd = c.price if c else 0.0
+    if price_usd:
+        in_near = f" ({near_px(price_usd / usd_near)} Ⓝ)" if usd_near else ""
+        lines.append(f"💲 Цена: <b>{market.price_fmt(price_usd)}</b>{in_near}")
+        lp = c.liq or (route.wnear * 2 / YOCTO * usd_near if route and usd_near else 0)
+        lines.append(f"📈 MC: <b>{k_usd(c.fdv)}</b> · 💧 LP: <b>{k_usd(lp)}</b>")
+        if c.vol24 or c.txns24:
+            lines.append(f"📊 Объём 24ч: {k_usd(c.vol24)} · сделок {c.txns24}")
+        extra = []
+        if c.ath_mcap and c.ath_mcap > c.fdv * 1.01:
+            extra.append(f"🏆 ATH MC: {k_usd(c.ath_mcap)}")
+        if c.created_ms:
+            extra.append(f"⏱ {market.age_fmt(c.created_ms)}")
+        if extra:
+            lines.append(" · ".join(extra))
+    elif route:
         probe = YOCTO // 10  # цена по котировке 0.1 NEAR (с учётом комиссии пула)
         out = await ref.quote_route(route, WNEAR, probe, token)
-        price = (probe / YOCTO) / (out / 10 ** dec) if out else 0
-        lines.append(f"💲 Цена: <b>≈{price:.6g} NEAR</b>")
-        lines.append(f"💧 Ликвидность: {fmt_near(route.wnear * 2, 1)} NEAR · {esc(route.label)}")
-    except NoPool:
+        if out:
+            p_near = (probe / YOCTO) / (out / 10 ** dec)
+            lines.append(f"💲 Цена: <b>{near_px(p_near)} Ⓝ</b>" + (f" ({market.price_fmt(p_near * usd_near)})" if usd_near else ""))
+        lines.append(f"💧 LP: <b>{fmt_near(route.wnear * 2, 1)} Ⓝ</b>"
+                     + (f" ({k_usd(route.wnear * 2 / YOCTO * usd_near)})" if usd_near else ""))
+    if route:
+        lines.append(f"🔀 Пул: {esc(route.label)}")
+    else:
         lines.append("⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.")
+
     s = active_signer(uid)
     if s:
         bal = await ref.ft_balance(token, s.account_id)
         if bal:
-            line = f"👛 У вас: <b>{fmt_tok(bal, dec)} {esc(sym)}</b>"
+            lines.append("")
+            lines.append(f"👛 У вас: <b>{fmt_tok(bal, dec)} {esc(sym)}</b>")
             try:
                 if not route:
                     raise NoPool(token)
                 val = await ref.quote_route(route, token, bal, WNEAR)
                 spent, got = db.totals(s.account_id, token)
-                line += f" ≈ {fmt_near(val)} NEAR"
+                u = lambda y: f" (${y / YOCTO * usd_near:,.2f})" if usd_near else ""
+                if spent:
+                    lines.append(f"📥 Вложено: <b>{fmt_near(spent)} Ⓝ</b>{u(spent)}")
+                lines.append(f"💰 Текущая стоимость: <b>{fmt_near(val)} Ⓝ</b>{u(val)}")
                 if spent:
                     pnl = got + val - spent
-                    line += f"\n📈 PnL: <b>{'+' if pnl >= 0 else '−'}{fmt_near(abs(pnl))} NEAR</b> ({pnl / spent * 100:+.1f}%)"
+                    lines.append(f"{'📈' if pnl >= 0 else '📉'} PnL: <b>{'+' if pnl >= 0 else '−'}{fmt_near(abs(pnl))} Ⓝ</b> "
+                                 f"({pnl / spent * 100:+.1f}%)")
             except (NoPool, RpcError):
                 pass
-            lines.append(line)
-        lines.append(f"\n👛 {esc(short(s.account_id))} · баланс {fmt_near(await ref.native_balance(s.account_id))} NEAR")
-    lines.append(f"⚙️ Слиппедж: {slippage_bps(uid) / 100:g}%")
-    lines.append(f'<a href="https://nearblocks.io/token/{esc(token)}">Nearblocks</a> · '
-                 f'<a href="https://dexscreener.com/near/{esc(token)}">DexScreener</a>')
+        lines.append("")
+        lines.append(f"👛 {esc(short(s.account_id))} · {fmt_near(await ref.native_balance(s.account_id))} Ⓝ · "
+                     f"⚙️ слиппедж {slippage_bps(uid) / 100:g}%")
+    if c and c.links:
+        lines.append("")
+        lines.append(" • ".join(f'<a href="{esc(u)}">{esc(lb)}</a>' for lb, u in c.links[:4]))
+
+    png = None
+    if c and len(c.candles) >= 3:
+        if not c.symbol or c.symbol == "?":
+            c.symbol = sym
+        try:
+            png = await asyncio.to_thread(market.render_chart, c)
+        except Exception as e:
+            log.info("chart %s: %s", token, e)
     pr = presets(uid)
     kb = KB([
-        [B(f"🟢 {a} NEAR", callback_data=f"b:{a}:{tid}") for a in pr[:4]],
-        [B("🟢 ✏️ X NEAR", callback_data=f"bx:{tid}"), B("🔄 Обновить", callback_data=f"c:{tid}")],
+        [B(f"🟢 {a} Ⓝ", callback_data=f"b:{a}:{tid}") for a in pr[:4]],
+        [B("🟢 ✏️ X Ⓝ", callback_data=f"bx:{tid}"), B("🔄 Обновить", callback_data=f"c:{tid}")],
         [B("🔴 25%", callback_data=f"s:25:{tid}"), B("🔴 50%", callback_data=f"s:50:{tid}"),
          B("🔴 100%", callback_data=f"s:100:{tid}"), B("🔴 ✏️ X%", callback_data=f"sx:{tid}")],
     ])
-    return "\n".join(lines), kb
+    return "\n".join(lines), kb, png
 
 
 def find_token(text: str) -> str | None:
@@ -526,19 +605,31 @@ def find_token(text: str) -> str | None:
 
 
 async def send_card(uid: int, chat, token: str, edit_msg=None):
+    png = None
     try:
-        text, kb = await token_card(uid, token)
+        text, kb, png = await token_card(uid, token)
     except RpcError as e:
         busy = "429" in str(e) or "Rate limit" in str(e) or "все RPC" in str(e)
         text = ("⏳ Сеть NEAR сейчас перегружена запросами, карточка не загрузилась. Нажмите «Обновить» через пару секунд."
                 if busy else f"Не удалось прочитать токен: {esc(str(e)[:200])}")
         tid = db.token_id(token)
         kb = KB([[B("🔄 Обновить", callback_data=f"c:{tid}")]])
+    if png and len(html.unescape(re.sub(r"<[^>]+>", "", text))) > 1000:
+        png = None  # подпись к фото ограничена 1024 символами — тогда отправляем без графика
     if edit_msg:
         try:
-            await edit_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
-        except Exception:
-            pass
+            if edit_msg.photo and png:
+                await edit_msg.edit_media(InputMediaPhoto(png, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb)
+            elif edit_msg.photo:
+                await edit_msg.edit_caption(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                await edit_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        except Exception as e:
+            if "not modified" not in str(e):
+                log.info("card edit: %s", e)
+        return
+    if png:
+        await chat.send_photo(png, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
         await chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
