@@ -269,6 +269,21 @@ class Ref:
                                           gas=30 * TGAS, deposit=dep)], wait=wait)
         self._reg.add((token, s.account_id))
 
+    async def prepare_buy(self, s: Signer, token: str, deadline: float):
+        """Снайпер: регистрируемся в wNEAR и в новом токене заранее. Контракт токена может появиться на блок позже
+        аккаунта — повторяем, пока не выйдет время."""
+        if not await self._registered(WNEAR, s.account_id):
+            await self._register(s, WNEAR)
+        while True:
+            try:
+                if not await self._registered(token, s.account_id):
+                    await self._register(s, token)
+                return
+            except (RpcError, TxFailed) as e:
+                if "большой storage" in str(e) or time.time() > deadline:
+                    raise
+            await asyncio.sleep(0.3)
+
     async def ensure_storage(self, s: Signer, token: str):
         if not await self._registered(token, s.account_id):
             await self._register(s, token)
@@ -344,7 +359,7 @@ class Ref:
                             gas=180 * TGAS, deposit=ONE_YOCTO)
 
     async def buy(self, s: Signer, token: str, near_in: int, slippage_bps: int, route: Route | None = None,
-                  fast: bool = False) -> dict:
+                  fast: bool = False, tm: dict | None = None) -> dict:
         """fast (снайпер): маршрут уже найден, проверки идут параллельно, а регистрацию в токене не ждём до
         исполнения — свап проходит через wrap.near и Ref на несколько блоков дольше, регистрация успевает раньше."""
         r = route or await self.route(token, fresh=True)
@@ -357,13 +372,17 @@ class Ref:
         min_out = expected * (10_000 - slippage_bps) // 10_000
         if not reg_w:
             await self._register(s, WNEAR)
-        if not reg_tok:
+        if not reg_tok and (token, s.account_id) not in self._reg:
             await self._register(s, token, wait="INCLUDED" if fast else "EXECUTED_OPTIMISTIC")
+        if tm is not None:
+            tm["swap_sent"] = time.time()
         try:
             res = await s.send(WNEAR, [
                 FunctionCall("near_deposit", {}, gas=10 * TGAS, deposit=near_in),
                 self._swap_call(r, WNEAR, token, near_in, min_out),
             ])
+            if tm is not None:
+                tm["swap_done"] = time.time()
         finally:
             # при неудачном свапе wNEAR возвращается на кошелёк — разворачиваем обратно в NEAR
             try:

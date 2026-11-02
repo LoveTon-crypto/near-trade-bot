@@ -34,7 +34,7 @@ import copytrade
 import snipe
 import pnl_card
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
-from ref import Ref, NoPool, WNEAR
+from ref import Ref, NoPool, WNEAR, Route
 import wallets
 from wallets import Vault, WalletError
 
@@ -912,10 +912,11 @@ def wallet_id_of(uid: int, account: str) -> int | None:
     return r[0] if r else None
 
 
-async def swap_buy(uid: int, s: Signer, token: str, amount: int, slip: int, route=None, fast: bool = False) -> dict:
+async def swap_buy(uid: int, s: Signer, token: str, amount: int, slip: int, route=None, fast: bool = False,
+                   tm: dict | None = None) -> dict:
     """Покупка на amount NEAR: свапается amount − комиссия, комиссия уходит после успешного свапа."""
     fee = fee_of(amount, s.account_id)
-    r = await ref.buy(s, token, amount - fee, slip, route=route, fast=fast)
+    r = await ref.buy(s, token, amount - fee, slip, route=route, fast=fast, tm=tm)
     if fee:
         schedule_fee(uid, s, "buy", fee, r["hash"])
     return r
@@ -2284,10 +2285,15 @@ async def on_deploy(token: str, fac: str, dev: str, tx: str, tm: dict | None = N
 
 
 async def wait_pool(token: str, deadline: float):
-    delay = 0.3
+    """Пул после деплоя: часто (каждые 0.25 с) проверяем прямые пулы DCL token/wNEAR — это 4 лёгких запроса;
+    раз в ~1.5 с — полный поиск маршрута (классический Ref, индекс DCL, пары не к wNEAR)."""
+    n = 0
     while True:
         try:
-            return await ref.route(token, fresh=True)
+            if n % 6 == 5:
+                return await ref.route(token, fresh=True)
+            pid, wn = await ref.dcl_pool(token)
+            return Route("dcl", pid, wn)
         except NoPool:
             if time.time() > deadline:
                 raise
@@ -2295,8 +2301,8 @@ async def wait_pool(token: str, deadline: float):
             if time.time() > deadline:
                 raise
             log.info("snipe pool %s: %s", token, str(e)[:100])
-        await asyncio.sleep(delay)
-        delay = min(delay * 1.3, 1.5)
+        n += 1
+        await asyncio.sleep(0.25)
 
 
 async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str, tm: dict | None = None):
@@ -2331,14 +2337,25 @@ async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str, tm: dict | No
                               f"не хватает на {fmt_near(amount)} Ⓝ + газ.")
             return
         mark("start")
-        route = await wait_pool(token, time.time() + POOL_WAIT_SEC)
+        # регистрацию в токене (storage) делаем, пока ждём пул, — к покупке она уже готова
+        prep = asyncio.create_task(ref.prepare_buy(s, token, time.time() + POOL_WAIT_SEC))
+        try:
+            route = await wait_pool(token, time.time() + POOL_WAIT_SEC)
+        except BaseException:
+            prep.cancel()
+            raise
         mark("pool")
+        try:
+            await asyncio.wait_for(asyncio.shield(prep), 2.5)
+            mark("storage")
+        except Exception as e:
+            log.info("snipe storage %s: %s", token, str(e)[:120])
         key = (s.account_id, token)
         while key in BUSY:
             await asyncio.sleep(0.05)
         BUSY.add(key)
         try:
-            r = await swap_buy(uid, s, token, amount, t["slippage_bps"], route=route, fast=True)
+            r = await swap_buy(uid, s, token, amount, t["slippage_bps"], route=route, fast=True, tm=tm)
         finally:
             BUSY.discard(key)
         mark("bought")
