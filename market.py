@@ -550,7 +550,8 @@ def price_fmt(p: float) -> str:
         return "$0"
     if p >= 1:
         return f"${p:,.4f}"
-    s = f"{p:.20f}".split(".")[1]
+    from decimal import Decimal
+    s = format(Decimal(repr(p)), "f").split(".")[1] + "0" * 20  # repr: 0.0014 не превращается в 0.0013999…
     zeros = len(s) - len(s.lstrip("0"))
     digits = s[zeros:zeros + 4].rstrip("0") or "0"
     if zeros >= 4:
