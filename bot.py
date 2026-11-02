@@ -2284,16 +2284,22 @@ async def on_deploy(token: str, fac: str, dev: str, tx: str, tm: dict | None = N
             asyncio.create_task(run_snipe(t, token, snipe.FACTORIES.get(fac, fac), tx, dict(tm or {})))
 
 
-async def wait_pool(token: str, deadline: float):
+async def wait_pool(token: str, deadline: float, probe: int = YOCTO // 100):
     """Пул после деплоя: часто (каждые 0.25 с) проверяем прямые пулы DCL token/wNEAR — это 4 лёгких запроса;
     раз в ~1.5 с — полный поиск маршрута (классический Ref, индекс DCL, пары не к wNEAR)."""
     n = 0
     while True:
         try:
             if n % 6 == 5:
-                return await ref.route(token, fresh=True)
-            pid, wn = await ref.dcl_pool(token)
-            return Route("dcl", pid, wn)
+                route = await ref.route(token, fresh=True)
+            else:
+                pid, wn = await ref.dcl_pool(token)
+                route = Route("dcl", pid, wn)
+            # пул есть, но купить в нём нельзя (сломанный запуск, цена вне диапазона) — ждём дальше
+            if await ref.quote_route(route, WNEAR, probe, token) > 0:
+                return route
+            if time.time() > deadline:
+                raise NoPool(token)
         except NoPool:
             if time.time() > deadline:
                 raise
@@ -2340,7 +2346,7 @@ async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str, tm: dict | No
         # регистрацию в токене (storage) делаем, пока ждём пул, — к покупке она уже готова
         prep = asyncio.create_task(ref.prepare_buy(s, token, time.time() + POOL_WAIT_SEC))
         try:
-            route = await wait_pool(token, time.time() + POOL_WAIT_SEC)
+            route = await wait_pool(token, time.time() + POOL_WAIT_SEC, amount)
         except BaseException:
             prep.cancel()
             raise
