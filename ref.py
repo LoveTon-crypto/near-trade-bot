@@ -8,9 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 
-from near import Rpc, Signer, FunctionCall, TGAS, ONE_YOCTO, YOCTO, TxFailed
+from near import Rpc, RpcError, Signer, FunctionCall, TGAS, ONE_YOCTO, YOCTO, TxFailed
 
 log = logging.getLogger("ref")
 
@@ -40,6 +41,8 @@ class Route:
 class Ref:
     def __init__(self, rpc: Rpc):
         self.rpc = rpc
+        self._meta: dict[str, dict] = {}
+        self._routes: dict[str, tuple[float, Route]] = {}
         self.pools_by_token: dict[str, list[int]] = {}
         self.indexed = 0
         self._idx_lock = asyncio.Lock()
@@ -90,11 +93,13 @@ class Ref:
     async def dcl_pool(self, token: str) -> tuple[str, int]:
         """(pool_id, резерв wNEAR) лучшего пула DCL token/wNEAR. Состав пула проверяется в самом контракте."""
         best = None
-        a, b = sorted([token, WNEAR])  # в DCL токены в id пула идут по алфавиту; обратный порядок — на всякий случай
-        for pid in [f"{x}|{y}|{fee}" for fee in DCL_FEES for x, y in ((a, b), (b, a))]:
+        a, b = sorted([token, WNEAR])  # в DCL токены в id пула идут по алфавиту
+        for pid in [f"{a}|{b}|{fee}" for fee in DCL_FEES]:
             try:
                 p = await self.rpc.view(DCL, "get_pool", {"pool_id": pid})
-            except Exception:
+            except RpcError as e:
+                if "все RPC" in str(e):
+                    raise  # сеть недоступна — это не «пула нет»
                 p = None
             if not p or {p.get("token_x"), p.get("token_y")} != {token, WNEAR}:
                 continue
@@ -107,8 +112,11 @@ class Ref:
             raise NoPool(token)
         return best
 
-    async def route(self, token: str) -> Route:
-        """Пул с наибольшей ликвидностью wNEAR: классический Ref или DCL."""
+    async def route(self, token: str, fresh: bool = False) -> Route:
+        """Пул с наибольшей ликвидностью wNEAR: классический Ref или DCL. Кэш 60 сек (сделки берут свежий)."""
+        hit = self._routes.get(token)
+        if hit and not fresh and time.time() - hit[0] < 60:
+            return hit[1]
         cands = []
         try:
             pid, wn = await self.best_pool(token)
@@ -122,7 +130,9 @@ class Ref:
             pass
         if not cands:
             raise NoPool(token)
-        return max(cands, key=lambda r: r.wnear)
+        best = max(cands, key=lambda r: r.wnear)
+        self._routes[token] = (time.time(), best)
+        return best
 
     async def quote_route(self, r: Route, token_in: str, amount_in: int, token_out: str) -> int:
         if r.kind == "ref":
@@ -163,7 +173,9 @@ class Ref:
                                           gas=30 * TGAS, deposit=dep)])
 
     async def ft_metadata(self, token: str) -> dict:
-        return await self.rpc.view(token, "ft_metadata") or {}
+        if token not in self._meta:
+            self._meta[token] = await self.rpc.view(token, "ft_metadata") or {}
+        return self._meta[token]
 
     # ------------------------------------------------------------ свапы
     @staticmethod
@@ -203,7 +215,7 @@ class Ref:
                             gas=180 * TGAS, deposit=ONE_YOCTO)
 
     async def buy(self, s: Signer, token: str, near_in: int, slippage_bps: int) -> dict:
-        r = await self.route(token)
+        r = await self.route(token, fresh=True)
         pool_id = r.pool_id
         expected = await self.quote_route(r, WNEAR, near_in, token)
         if expected <= 0:
@@ -231,7 +243,7 @@ class Ref:
         return {"pool_id": pool_id, "route": r, "got": got, "expected": expected, "spent": near_in, "hash": res["_hash"]}
 
     async def sell(self, s: Signer, token: str, amount: int, slippage_bps: int) -> dict:
-        r = await self.route(token)
+        r = await self.route(token, fresh=True)
         pool_id = r.pool_id
         expected = await self.quote_route(r, token, amount, WNEAR)
         if expected <= 0:

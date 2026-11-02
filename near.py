@@ -158,29 +158,46 @@ class TxFailed(Exception):
 
 
 class Rpc:
-    def __init__(self, urls: list[str]):
+    """JSON-RPC с перебором узлов: таймаут, перегрузка или лимит запросов (429) → следующий узел, потом повтор."""
+
+    def __init__(self, urls: list[str], api_key: str = ""):
         self.urls = urls
+        self.api_key = api_key
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(20.0, read=70.0),
                                       headers={"User-Agent": "near-trade-bot/1.0"})
 
+    def _headers(self, url: str) -> dict | None:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key and "fastnear" in url else None
+
+    @staticmethod
+    def _retryable(err: dict, status: int) -> bool:
+        name = (err.get("cause") or {}).get("name") or err.get("name") or ""
+        text = json.dumps(err)
+        return (name in ("TIMEOUT_ERROR", "INTERNAL_ERROR") or status >= 500 or status == 429
+                or err.get("code") == -429 or "Rate limit" in text or "rate limit" in text)
+
     async def call(self, method: str, params) -> dict:
         last = None
-        for url in self.urls:
-            try:
-                r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params})
-                data = r.json()
-            except (httpx.HTTPError, ValueError) as e:
-                last = e
-                continue
-            if "error" in data:
-                err = data["error"]
-                name = (err.get("cause") or {}).get("name") or err.get("name") or ""
-                # таймаут и перегрузку пробуем на другом RPC, остальные ошибки сразу наверх
-                if name in ("TIMEOUT_ERROR", "INTERNAL_ERROR") or r.status_code >= 500:
-                    last = RpcError(json.dumps(err)[:500])
+        for attempt in range(3):
+            for url in self.urls:
+                try:
+                    r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
+                                             headers=self._headers(url))
+                    data = r.json()
+                except (httpx.HTTPError, ValueError) as e:
+                    last = e
                     continue
-                raise RpcError(json.dumps(err)[:800])
-            return data["result"]
+                if "error" in data:
+                    err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
+                    if self._retryable(err, r.status_code):
+                        last = RpcError(json.dumps(err)[:300])
+                        continue
+                    raise RpcError(json.dumps(err)[:800])
+                if "result" not in data:
+                    last = RpcError(str(data)[:300])
+                    continue
+                return data["result"]
+            await asyncio.sleep(0.6 * (attempt + 1))
         raise RpcError(f"все RPC недоступны: {last}")
 
     async def view(self, contract: str, method: str, args: dict | None = None, finality="optimistic"):

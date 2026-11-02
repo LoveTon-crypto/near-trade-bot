@@ -33,7 +33,9 @@ log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 RPC_URLS = [u.strip() for u in os.getenv(
-    "RPC_URLS", "https://rpc.mainnet.fastnear.com,https://free.rpc.fastnear.com,https://rpc.mainnet.near.org").split(",") if u.strip()]
+    "RPC_URLS", "https://rpc.mainnet.fastnear.com,https://near.lava.build,https://free.rpc.fastnear.com,"
+                "https://rpc.mainnet.near.org").split(",") if u.strip()]
+FASTNEAR_API_KEY = os.getenv("FASTNEAR_API_KEY", "").strip()
 MAX_BUY = to_yocto(os.getenv("MAX_BUY_NEAR", "100"))
 GAS_RESERVE = to_yocto(os.getenv("GAS_RESERVE_NEAR", "0.1"))
 MAX_WALLETS = int(os.getenv("MAX_WALLETS", "10"))
@@ -44,7 +46,7 @@ URL_RES = [re.compile(r"nearly\.trade/([a-z0-9_\-.]+)"), re.compile(r"justhoot\.
            re.compile(r"nearblocks\.io/(?:token|address)/([a-z0-9_\-.]+)")]
 
 db = DB(os.getenv("DB_PATH", "trade.db"))
-rpc = Rpc(RPC_URLS)
+rpc = Rpc(RPC_URLS, FASTNEAR_API_KEY)
 ref = Ref(rpc)
 vault = Vault(wallets.load_master_key())
 
@@ -527,7 +529,11 @@ async def send_card(uid: int, chat, token: str, edit_msg=None):
     try:
         text, kb = await token_card(uid, token)
     except RpcError as e:
-        text, kb = f"Не удалось прочитать токен: {esc(str(e)[:200])}", None
+        busy = "429" in str(e) or "Rate limit" in str(e) or "все RPC" in str(e)
+        text = ("⏳ Сеть NEAR сейчас перегружена запросами, карточка не загрузилась. Нажмите «Обновить» через пару секунд."
+                if busy else f"Не удалось прочитать токен: {esc(str(e)[:200])}")
+        tid = db.token_id(token)
+        kb = KB([[B("🔄 Обновить", callback_data=f"c:{tid}")]])
     if edit_msg:
         try:
             await edit_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
@@ -640,7 +646,11 @@ async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = s.account_id
     rows, kb = [], []
     for token in db.traded_tokens(acc)[:15]:
-        bal = await ref.ft_balance(token, acc)
+        try:
+            bal = await ref.ft_balance(token, acc)
+        except RpcError:
+            rows.append(f"<b>{esc(token)}</b> · ⚠️ сеть перегружена, обновите позже")
+            continue
         if not bal:
             continue
         tid = db.token_id(token)
