@@ -144,7 +144,8 @@ class Scanner:
         self._chart_cache: dict[str, tuple[float, list]] = {}
         self._ath_cache: dict[str, tuple[float, float]] = {}     # токен -> (время, макс. цена)
         self._dcl_cache: dict[str, tuple[float, str | None]] = {}
-        self._ath_busy: set[str] = set()  # токен -> (время, pool_id DCL или None)
+        self._ath_busy: set[str] = set()
+        self._prefetching: set[str] = set()  # токен -> (время, pool_id DCL или None)
         self._near_px: tuple[float, float] | None = None
         self._meta: dict[str, tuple[float, dict, int]] = {}
         self._nearly: dict[str, tuple[float, dict]] = {}       # токен -> (время, /api/launch)   # токен -> (время, ft_metadata, supply_raw)
@@ -225,7 +226,34 @@ class Scanner:
             await self._fill_holders(c)
         if with_chart:
             await self._fill_chart(c)
+        else:
+            self._cached_ath(c)
+            self.prefetch_chart(c)
         return c
+
+    def _cached_ath(self, c: TokenCard):
+        """ATH из уже загруженных свечей (без новых запросов) — для быстрой карточки без графика."""
+        best = max((r[2] for r in (self._chart_cache.get(c.address) or (0, []))[1]), default=0.0)
+        best = max(best, (self._ath_cache.get(c.address) or (0, 0.0))[1])
+        if best and c.supply:
+            c.ath_mcap = max(c.ath_mcap, best * c.supply, c.fdv)
+
+    def prefetch_chart(self, c: TokenCard):
+        """Свечи и ATH грузим в фоне: кнопка «График» откроется быстрее, ATH появится при обновлении."""
+        if c.address in self._prefetching:
+            return
+        self._prefetching.add(c.address)
+        tmp = TokenCard(address=c.address, symbol=c.symbol, decimals=c.decimals, supply_raw=c.supply_raw,
+                        price=c.price, fdv=c.fdv)
+
+        async def run():
+            try:
+                await self._fill_chart(tmp)
+            except Exception as e:
+                log.info("prefetch chart %s: %s", c.address, e)
+            finally:
+                self._prefetching.discard(c.address)
+        asyncio.create_task(run())
 
     async def _fill_market(self, c: TokenCard):
         data = await self._json("GET", f"{DEXS}/tokens/v1/near/{c.address}")
