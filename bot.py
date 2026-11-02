@@ -41,7 +41,14 @@ FASTNEAR_API_KEY = os.getenv("FASTNEAR_API_KEY", "").strip()
 MAX_BUY = to_yocto(os.getenv("MAX_BUY_NEAR", "100"))
 GAS_RESERVE = to_yocto(os.getenv("GAS_RESERVE_NEAR", "0.1"))
 MAX_WALLETS = int(os.getenv("MAX_WALLETS", "10"))
-SECRET_TTL = int(os.getenv("SECRET_MESSAGE_TTL", "120"))  # сек, через сколько удалять сообщения с ключами
+SECRET_TTL = int(os.getenv("SECRET_MESSAGE_TTL", "120"))
+# Комиссия бота и рефералка: FEE_BPS от каждой сделки уходит на FEE_ACCOUNT, из неё REF_SHARES (% по уровням)
+# начисляются пригласившим. Реферальный доход выплачивается с FEE_ACCOUNT (ключ задаётся через admin.py).
+FEE_BPS = int(os.getenv("FEE_BPS", "100"))
+FEE_ACCOUNT = os.getenv("FEE_ACCOUNT", "buddhadefi-hot.tg").strip().lower()
+REF_SHARES = [int(x) for x in os.getenv("REF_SHARES", "30,10,5").split(",") if x.strip()]
+REF_MIN_WITHDRAW = to_yocto(os.getenv("REF_MIN_WITHDRAW_NEAR", "0.1"))
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}  # сек, через сколько удалять сообщения с ключами
 
 ADDR_RE = re.compile(r"(?<![\w.-])((?:[a-z0-9_\-]+\.)+(?:near|tg)|[0-9a-f]{64})(?![\w.-])")
 URL_RES = [re.compile(r"nearly\.trade/([a-z0-9_\-.]+)"), re.compile(r"justhoot\.fun/p/([a-z0-9_\-.]+)"),
@@ -55,7 +62,7 @@ scanner = market.Scanner(rpc)
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
-MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "↗️ Вывод"], ["⚙️ Настройки"]],
+MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "↗️ Вывод"], ["🤝 Рефералы", "⚙️ Настройки"]],
                            resize_keyboard=True)
 _price = {"usd": 0.0, "ts": 0.0}
 
@@ -140,6 +147,14 @@ async def need_wallet(update: Update) -> Signer | None:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ctx.user_data.pop("await", None)
+    if ctx.args and ctx.args[0].startswith("r") and db.is_fresh(uid):
+        ref_uid = db.user_by_code(ctx.args[0][1:])
+        if ref_uid and db.set_referrer(uid, ref_uid):
+            try:
+                await ctx.bot.send_message(ref_uid, "🎉 По твоей ссылке пришёл новый пользователь! "
+                                                    "Ты будешь получать часть комиссии с его сделок.")
+            except Exception:
+                pass
     s = active_signer(uid)
     if not s:
         await update.message.reply_text(
@@ -749,6 +764,68 @@ async def send_card(uid: int, chat, token: str, edit_msg=None):
 
 
 # ---------------------------------------------------------------- торговля
+def fee_of(amount: int, account: str) -> int:
+    if not FEE_BPS or not FEE_ACCOUNT or account == FEE_ACCOUNT:
+        return 0
+    return amount * FEE_BPS // 10_000
+
+
+def wallet_id_of(uid: int, account: str) -> int | None:
+    r = db.c.execute("SELECT id FROM wallets WHERE user_id=? AND account=?", (uid, account)).fetchone()
+    return r[0] if r else None
+
+
+async def swap_buy(uid: int, s: Signer, token: str, amount: int, slip: int) -> dict:
+    """Покупка на amount NEAR: свапается amount − комиссия, комиссия уходит после успешного свапа."""
+    fee = fee_of(amount, s.account_id)
+    r = await ref.buy(s, token, amount - fee, slip)
+    if fee:
+        schedule_fee(uid, s, "buy", fee, r["hash"])
+    return r
+
+
+async def swap_sell(uid: int, s: Signer, token: str, amount: int, slip: int) -> dict:
+    """Продажа: комиссия берётся с полученных NEAR; в r["got"] — сумма уже за вычетом комиссии."""
+    r = await ref.sell(s, token, amount, slip)
+    fee = fee_of(r["got"], s.account_id)
+    if fee:
+        r["got"] -= fee
+        schedule_fee(uid, s, "sell", fee, r["hash"])
+    return r
+
+
+def schedule_fee(uid: int, s: Signer, side: str, fee: int, swap_tx: str):
+    fid = db.add_fee(uid, wallet_id_of(uid, s.account_id), side, fee, swap_tx)
+    asyncio.create_task(pay_fee(fid, uid, s, fee))
+
+
+def ref_shares(uid: int, fee: int) -> list[tuple[int, int, int]]:
+    return [(up, lvl, fee * pct // 100) for lvl, (up, pct) in enumerate(zip(db.upline(uid, len(REF_SHARES)), REF_SHARES), 1)]
+
+
+async def pay_fee(fid: int, uid: int, s: Signer, fee: int, tries: int = 0) -> bool:
+    try:
+        res = await ref.withdraw_near(s, FEE_ACCOUNT, fee)
+    except (TxFailed, RpcError) as e:
+        db.fee_failed(fid, str(e), give_up=tries >= 19)
+        log.info("fee %s not sent yet: %s", fid, str(e)[:120])
+        return False
+    db.fee_paid(fid, res["_hash"], ref_shares(uid, fee))
+    return True
+
+
+async def retry_fees(ctx: ContextTypes.DEFAULT_TYPE):
+    for fid, uid, wid, amount, tries in db.pending_fees():
+        s = signer_for(uid, wid) if wid else None
+        if not s:
+            db.fee_failed(fid, "кошелёк удалён", give_up=True)
+            continue
+        if await ref.native_balance(s.account_id) < int(amount) + YOCTO // 1000:
+            db.fee_failed(fid, "не хватает NEAR на комиссию", give_up=tries >= 19)
+            continue
+        await pay_fee(fid, uid, s, int(amount), tries)
+
+
 async def do_buy(uid: int, s: Signer, chat, token: str, amount: int):
     if amount > MAX_BUY:
         await chat.send_message(f"Больше лимита {fmt_near(MAX_BUY)} NEAR на одну покупку.")
@@ -764,7 +841,7 @@ async def do_buy(uid: int, s: Signer, chat, token: str, amount: int):
     BUSY.add(key)
     msg = await chat.send_message(f"⏳ Покупаю на {fmt_near(amount)} NEAR…")
     try:
-        r = await ref.buy(s, token, amount, slippage_bps(uid))
+        r = await swap_buy(uid, s, token, amount, slippage_bps(uid))
         db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
         meta = await ref.ft_metadata(token)
         await msg.edit_text(f"✅ Куплено <b>{fmt_tok(r['got'], int(meta.get('decimals') or 0))} "
@@ -794,7 +871,7 @@ async def do_sell(uid: int, s: Signer, chat, token: str, pct: Decimal):
     BUSY.add(key)
     msg = await chat.send_message(f"⏳ Продаю {pct:g}%…")
     try:
-        r = await ref.sell(s, token, amount, slippage_bps(uid))
+        r = await swap_sell(uid, s, token, amount, slippage_bps(uid))
         db.add_trade(s.account_id, token, "sell", amount, r["got"], r["hash"])
         await msg.edit_text(f"✅ Продано {pct:g}% → <b>{fmt_near(r['got'])} NEAR</b> · {nb_tx(r['hash'])}",
                             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -1295,7 +1372,7 @@ async def execute_order(tg_bot, o: dict, st: dict):
                 await tell(f"❌ Ордер #{o['id']} сработал, но на кошельке {fmt_near(bal)} Ⓝ — "
                            f"не хватает на покупку {fmt_near(amount)} Ⓝ + газ. Ордер закрыт.")
                 return
-            r = await ref.buy(s, token, amount, o["slippage_bps"])
+            r = await swap_buy(uid, s, token, amount, o["slippage_bps"])
             db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
             db.finish_order(o["id"], "done", tx=r["hash"])
             await tell(f"✅ <b>Лимит-ордер #{o['id']} исполнен</b>\nКуплено <b>{fmt_tok(r['got'], dec)} ${esc(sym)}</b> "
@@ -1307,7 +1384,7 @@ async def execute_order(tg_bot, o: dict, st: dict):
                 db.finish_order(o["id"], "failed", note="нечего продавать")
                 await tell(f"❌ Ордер #{o['id']} сработал, но ${esc(sym)} на кошельке нет. Ордер закрыт.")
                 return
-            r = await ref.sell(s, token, amount, o["slippage_bps"])
+            r = await swap_sell(uid, s, token, amount, o["slippage_bps"])
             db.add_trade(s.account_id, token, "sell", amount, r["got"], r["hash"])
             db.finish_order(o["id"], "done", tx=r["hash"])
             what = "Стоп-лосс" if o["cond"] == "le" else "Тейк-профит"
@@ -1324,6 +1401,146 @@ async def execute_order(tg_bot, o: dict, st: dict):
         await tell(f"❌ Ордер #{o['id']} (${esc(sym)}) не исполнен из-за внутренней ошибки. Проверьте баланс.")
     finally:
         BUSY.discard(key)
+
+
+# ---------------------------------------------------------------- рефералы
+def payout_signer() -> Signer | None:
+    """Кошелёк выплат реферального дохода = FEE_ACCOUNT. Ключ задаётся на сервере: admin.py payout-key."""
+    cfg = db.get("payout_wallet")
+    if not cfg or cfg.get("account") != FEE_ACCOUNT:
+        return None
+    s = SIGNERS.get(-1)
+    if not s:
+        kp, _ = vault.open(0, cfg["account"], bytes.fromhex(cfg["blob"]))
+        s = SIGNERS[-1] = Signer(rpc, cfg["account"], kp)
+    return s
+
+
+async def ref_view(uid: int, bot_username: str) -> tuple[str, KB]:
+    code = db.ref_code(uid)
+    link = f"https://t.me/{bot_username}?start=r{code}"
+    earned = db.ref_earned(uid)
+    counts = db.referral_counts(uid)
+    bal = db.ref_balance(uid)
+    usd = await near_usd()
+    u = lambda y: f" (${y / YOCTO * usd:,.2f})" if usd else ""
+    lines = ["🤝 <b>Реферальная программа</b>",
+             "Приглашай друзей и получай часть комиссии бота с каждой их сделки — пожизненно, по 3 уровням:",
+             "", "📦 <b>Твой доход</b>"]
+    for lvl, pct in enumerate(REF_SHARES, 1):
+        lines.append(f"{lvl} ур. ({pct}%): <b>{fmt_near(earned.get(lvl, 0))} Ⓝ</b> · 👤 {counts[lvl - 1] if lvl <= 3 else 0}")
+    lines += ["", f"Всего: <b>{fmt_near(sum(earned.values()))} Ⓝ</b>{u(sum(earned.values()))} · рефералов: 👤 {sum(counts)}",
+              f"Доступно для вывода: <b>{fmt_near(bal)} Ⓝ</b>{u(bal)}",
+              "", "🔗 <b>Твоя ссылка</b>", f"<code>{link}</code>"]
+    share = "https://t.me/share/url?url=" + link.replace(":", "%3A").replace("/", "%2F").replace("?", "%3F").replace("=", "%3D")
+    kb = KB([[B("📤 Поделиться ссылкой", url=share)],
+             [B(f"💸 Вывод (от {fmt_near(REF_MIN_WITHDRAW)} Ⓝ)", callback_data="rf:w")],
+             [B("🔄 Обновить", callback_data="rf:r")]])
+    return "\n".join(lines), kb
+
+
+async def show_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, kb = await ref_view(update.effective_user.id, ctx.bot.username)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                              disable_web_page_preview=True)
+
+
+async def on_ref_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if q.data == "rf:r":
+        await q.answer("Обновлено")
+        await edit_or_send(q, *await ref_view(uid, ctx.bot.username))
+        return
+    if q.data == "rf:w":
+        bal = db.ref_balance(uid)
+        if bal < REF_MIN_WITHDRAW:
+            await q.answer(f"Минимум для вывода {fmt_near(REF_MIN_WITHDRAW)} NEAR, сейчас {fmt_near(bal)}", show_alert=True)
+            return
+        s = active_signer(uid)
+        if not s:
+            await q.answer("Сначала создайте кошелёк — доход придёт на него", show_alert=True)
+            return
+        await q.answer()
+        await q.message.chat.send_message(
+            f"💸 Вывести <b>{fmt_near(bal)} Ⓝ</b> реферального дохода на кошелёк <code>{esc(s.account_id)}</code>?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=KB([[B("✅ Вывести", callback_data="rf:ok"), B("Отмена", callback_data="w:x:0")]]))
+        return
+    if q.data == "rf:ok":
+        await q.answer()
+        await ref_withdraw(q, uid)
+
+
+REF_LOCK = asyncio.Lock()
+
+
+async def ref_withdraw(q, uid: int):
+    s = active_signer(uid)
+    payer = payout_signer()
+    if not s:
+        await q.edit_message_text("Сначала создайте кошелёк.")
+        return
+    if not payer:
+        await q.edit_message_text("⏳ Выплаты временно недоступны, попробуйте позже.")
+        for a in ADMIN_IDS:
+            try:
+                await q.get_bot().send_message(a, "⚠️ Запрошен вывод реферального дохода, но ключ кошелька выплат "
+                                                  f"{FEE_ACCOUNT} не задан. На сервере: admin.py payout-key")
+            except Exception:
+                pass
+        return
+    async with REF_LOCK:  # один вывод за раз: баланс не уйдёт дважды
+        bal = db.ref_balance(uid)
+        if bal < REF_MIN_WITHDRAW:
+            await q.edit_message_text(f"Недостаточно для вывода: {fmt_near(bal)} Ⓝ.")
+            return
+        if await ref.native_balance(payer.account_id) < bal + YOCTO // 100:
+            await q.edit_message_text("⏳ Выплаты временно недоступны, попробуйте позже.")
+            return
+        pid = db.add_payout(uid, bal, s.account_id)
+    await q.edit_message_text("⏳ Отправляю…")
+    try:
+        res = await ref.withdraw_near(payer, s.account_id, bal)
+    except (TxFailed, RpcError) as e:
+        db.finish_payout(pid, "failed", getattr(e, "tx_hash", None), str(e)[:200])
+        await q.edit_message_text("❌ Вывод не прошёл, средства остались на реферальном балансе. Попробуйте позже.")
+        return
+    db.finish_payout(pid, "done", res["_hash"])
+    await q.edit_message_text(f"✅ Выведено {fmt_near(bal)} Ⓝ на <code>{esc(s.account_id)}</code> · {nb_tx(res['_hash'])}",
+                              parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def payout_key_status(payer: Signer | None) -> str:
+    if not payer:
+        return "❌ не задан (на сервере: admin.py payout-key)"
+    try:
+        await payer.check_key()
+        return "✅ задан и подходит"
+    except RpcError as e:
+        return f"❌ не подходит к {esc(FEE_ACCOUNT)}: {esc(str(e)[:80])}"
+
+
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    st = db.fee_stats()
+    payer = payout_signer()
+    pbal = await ref.native_balance(FEE_ACCOUNT)
+    owed = st["ref_accrued"] - st["ref_paid"]
+    lines = ["🛠 <b>Админ</b>",
+             f"Комиссия: {FEE_BPS / 100:g}% → <code>{esc(FEE_ACCOUNT)}</code> · рефералам {'/'.join(map(str, REF_SHARES))}%",
+             f"Баланс {esc(FEE_ACCOUNT)}: <b>{fmt_near(pbal)} Ⓝ</b>",
+             f"Ключ выплат: {await payout_key_status(payer)}", "",
+             f"Собрано комиссий: <b>{fmt_near(st['paid'])} Ⓝ</b> · ждут отправки {fmt_near(st['pending'])} · "
+             f"не дошли {fmt_near(st['failed'])}",
+             f"Начислено рефералам: {fmt_near(st['ref_accrued'])} Ⓝ · выплачено {fmt_near(st['ref_paid'])} · "
+             f"<b>к выплате {fmt_near(owed)} Ⓝ</b>",
+             f"Чистый доход: <b>{fmt_near(st['paid'] - st['ref_accrued'])} Ⓝ</b>", "",
+             f"Пользователей: {st['users']} · пришли по рефке: {st['with_ref']} · сделок с комиссией: {st['trades']}"]
+    if payer and pbal < owed:
+        lines.append("⚠️ На кошельке меньше, чем должны рефералам — пополните или не выводите.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------- позиции
@@ -1395,7 +1612,7 @@ def parse_num(s: str) -> Decimal | None:
 
 
 MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings,
-                "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders}
+                "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders, "🤝 Рефералы": show_ref}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1472,7 +1689,8 @@ async def post_init(app: Application):
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
     await app.bot.set_my_commands([("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"),
-                                   ("orders", "Лимит-ордера"), ("withdraw", "Вывод средств"), ("settings", "Настройки")])
+                                   ("orders", "Лимит-ордера"), ("withdraw", "Вывод средств"), ("ref", "Рефералы"),
+                                   ("settings", "Настройки")])
     db.reset_stuck_orders()
 
 
@@ -1495,6 +1713,9 @@ def main():
     app.add_handler(CommandHandler("settings", show_settings))
     app.add_handler(CommandHandler("withdraw", cmd_withdraw))
     app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(CommandHandler("ref", show_ref))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_ref_cb, pattern=r"^rf:"))
     app.add_handler(CallbackQueryHandler(on_order_cb, pattern=r"^lo:"))
     app.add_handler(CallbackQueryHandler(on_cancel_cb, pattern=r"^w:x:"))
     app.add_handler(CallbackQueryHandler(on_wallet_cb, pattern=r"^w:"))
@@ -1505,6 +1726,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_orders, interval=ORDER_POLL, first=20)
+    app.job_queue.run_repeating(retry_fees, interval=120, first=60)
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 
