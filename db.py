@@ -127,16 +127,33 @@ class DB:
         return [r[0] for r in self.c.execute(
             "SELECT token FROM trades WHERE account=? GROUP BY token ORDER BY MAX(ts) DESC", (account,))]
 
-    def totals(self, account, token) -> tuple[int, int]:
-        """(NEAR spent, NEAR received) for a token on this wallet."""
-        spent = got = 0
-        for side, near in self.c.execute("SELECT side, near_amt FROM trades WHERE account=? AND token=?",
-                                         (account, token)):
+    def position(self, account, token) -> dict:
+        """Текущая позиция по токену: считается с момента, когда токен был куплен после полного выхода.
+        Если всё продано (осталось < 1% от максимума), следующая покупка начинает новую позицию с нуля."""
+        spent = got = held = peak = 0
+        since = None
+        for ts, side, tok, near in self.c.execute(
+                "SELECT ts, side, token_amt, near_amt FROM trades WHERE account=? AND token=? ORDER BY ts, id",
+                (account, token)):
+            tok, near = int(tok), int(near)
             if side == "buy":
-                spent += int(near)
+                if held <= 0:
+                    spent = got = held = peak = 0
+                    since = ts
+                spent += near
+                held += tok
+                peak = max(peak, held)
             else:
-                got += int(near)
-        return spent, got
+                got += near
+                held -= tok
+                if held <= peak // 100:
+                    held = 0
+        return {"spent": spent, "got": got, "since": since, "open": held > 0}
+
+    def totals(self, account, token) -> tuple[int, int]:
+        """(NEAR вложено, NEAR получено) по текущей позиции; после полного выхода — (0, 0)."""
+        p = self.position(account, token)
+        return (p["spent"], p["got"]) if p["open"] else (0, 0)
 
     # limit orders
     #   side: buy|sell · cond: le (цена ≤ цели) | ge (цена ≥ цели)

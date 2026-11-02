@@ -223,6 +223,14 @@ EN: dict[str, str] = {
     "сид-фраза с ошибкой: проверьте слова и их порядок": "invalid seed phrase: check the words and their order",
     "это не сид-фраза и не приватный ключ ed25519:…": "this is neither a seed phrase nor an ed25519:… private key",
 
+    # PnL share
+    "📤 Поделиться PnL": "📤 Share PnL", "🙈 Скрыть": "🙈 Hide", "🎨 Рисую карточку…": "🎨 Drawing the card…",
+    "Нет открытой позиции по этому токену": "No open position in this token",
+    "⏳ Не удалось получить цену, попробуйте через пару секунд.": "⏳ Couldn't get the price, try again in a couple of seconds.",
+    "🤝 Делись с друзьями и получай до ": "🤝 Share with friends and earn up to ", "% комиссий!": "% of fees!",
+    "Чтобы купить токен, создайте кошелёк — это займёт секунду:": "To buy this token, create a wallet — it takes a second:",
+    " в NDbot 🚀 Купить в один клик:": " on NDbot 🚀 Buy it in one tap:",
+
     # language switch
     "🌐 Язык: Русский": "🌐 Language: English", "✅ Язык: русский": "✅ Language: English",
 }

@@ -478,7 +478,7 @@ class Scanner:
         if not pool:  # пула нет или запрос не прошёл — проверим снова при следующем скане
             self._gt_pool.pop(c.address, None)
         if not pool:
-            if c.src == "nearly" and await self._nearly_chart(c):
+            if (c.src == "nearly" or c.address.endswith(".nearlytrade.near")) and await self._nearly_chart(c):
                 return
             if c.onchain:
                 self._onchain_chart(c)
@@ -492,6 +492,8 @@ class Scanner:
             ohlcv = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
             c.candles = sorted((tuple(float(x) for x in row[:6]) for row in ohlcv if len(row) >= 6),
                                key=lambda r: r[0])
+            if len(c.candles) < 3 and c.address.endswith(".nearlytrade.near") and await self._nearly_chart(c):
+                pass  # GeckoTerminal знает пул, но свечей нет — берём свечи nearly.trade
             self._chart_cache[c.address] = (time.time(), c.candles)
         ath_price = max((r[2] for r in c.candles), default=0.0)
         cached_ath = self._ath_cache.get(c.address)

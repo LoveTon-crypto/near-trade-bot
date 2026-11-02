@@ -28,6 +28,7 @@ load_dotenv()
 from db import DB
 import market
 import i18n
+import pnl_art
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
 import wallets
@@ -225,14 +226,27 @@ async def need_wallet(update: Update) -> Signer | None:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ctx.user_data.pop("await", None)
-    if ctx.args and ctx.args[0].startswith("r") and db.is_fresh(uid):
-        ref_uid = db.user_by_code(ctx.args[0][1:])
+    arg = ctx.args[0] if ctx.args else ""
+    open_tid = None
+    if "_t" in arg:
+        arg, _, t = arg.partition("_t")
+        open_tid = int(t) if t.isdigit() else None
+    if arg.startswith("r") and db.is_fresh(uid):
+        ref_uid = db.user_by_code(arg[1:])
         if ref_uid and db.set_referrer(uid, ref_uid):
             try:
                 await ctx.bot.send_message(ref_uid, "🎉 По твоей ссылке пришёл новый пользователь! "
                                                     "Ты будешь получать часть комиссии с его сделок.")
             except Exception:
                 pass
+    if open_tid and db.token_by_id(open_tid):
+        token = db.token_by_id(open_tid)[0]
+        if not active_signer(uid):
+            await update.message.reply_text("Чтобы купить токен, создайте кошелёк — это займёт секунду:", reply_markup=MENU)
+            await update.message.reply_text("👛 Кошелёк:", reply_markup=KB([[B("➕ Создать", callback_data="w:new"),
+                                                                              B("📥 Импорт", callback_data="w:imp")]]))
+        await send_card(uid, update.effective_chat, token)
+        return
     s = active_signer(uid)
     if not s:
         await update.message.reply_text(
@@ -755,9 +769,11 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
         lines.append("⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.")
 
     s = active_signer(uid)
+    has_pos = False
     if s:
         bal = await ref.ft_balance(token, s.account_id)
         if bal:
+            has_pos = db.totals(s.account_id, token)[0] > 0
             lines.append("")
             lines.append(f"👛 У вас: <b>{fmt_tok(bal, dec)} {esc(sym)}</b>")
             try:
@@ -796,7 +812,8 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
         [B("🟢 ✏️ X Ⓝ", callback_data=f"bx:{tid}"), B("🔄 Обновить", callback_data=f"c:{tid}")],
         [B("🔴 25%", callback_data=f"s:25:{tid}"), B("🔴 50%", callback_data=f"s:50:{tid}"),
          B("🔴 100%", callback_data=f"s:100:{tid}"), B("🔴 ✏️ X%", callback_data=f"sx:{tid}")],
-        [B("📋 Лимит-ордер", callback_data=f"lo:new:{tid}")],
+        [B("📋 Лимит-ордер", callback_data=f"lo:new:{tid}")]
+        + ([B("📤 Поделиться PnL", callback_data=f"pn:{tid}")] if has_pos else []),
     ])
     return "\n".join(lines), kb, png
 
@@ -1621,6 +1638,64 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+# ---------------------------------------------------------------- поделиться PnL
+def hold_fmt(sec: float) -> str:
+    sec = int(max(sec, 0))
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m" if h else f"{m}m {sec % 60}s"
+
+
+def buy_link(bot_username: str, uid: int, tid: int) -> str:
+    """Ссылка на быструю покупку токена с рефералкой: t.me/<bot>?start=r<code>_t<tid>."""
+    return f"https://t.me/{bot_username}?start=r{db.ref_code(uid)}_t{tid}"
+
+
+def share_url(link: str, text: str) -> str:
+    from urllib.parse import quote
+    return f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(text, safe='')}"
+
+
+async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    token = _token_from_cb(q.data.split(":")[1])
+    s = active_signer(uid)
+    if not token or not s:
+        await q.answer("Токен не найден", show_alert=True)
+        return
+    pos = db.position(s.account_id, token)
+    if not pos["open"] or not pos["spent"]:
+        await q.answer("Нет открытой позиции по этому токену", show_alert=True)
+        return
+    await q.answer("🎨 Рисую карточку…")
+    tid = db.token_id(token)
+    _, sym, dec = db.token_by_id(tid)
+    meta = await ref.ft_metadata(token)
+    try:
+        bal = await ref.ft_balance(token, s.account_id)
+        val = await ref.quote_route(await ref.route(token), token, bal, WNEAR) if bal else 0
+    except (NoPool, RpcError):
+        await q.message.chat.send_message("⏳ Не удалось получить цену, попробуйте через пару секунд.")
+        return
+    spent, got = pos["spent"], pos["got"]
+    worth = got + val
+    pct = (worth / spent - 1) * 100
+    hold = hold_fmt(time.time() - pos["since"]) if pos["since"] else ""
+    link = buy_link(ctx.bot.username, uid, tid)
+    en = lang_of(uid) == "en"
+    png = await asyncio.to_thread(
+        pnl_art.render_position, sym or "?", str(meta.get("name") or "")[:28], pct, spent / YOCTO, worth / YOCTO, hold,
+        "NEAR", "NDBOT", f"Earn up to {REF_SHARES[0] if REF_SHARES else 0}% from each friend",
+        f"t.me/{ctx.bot.username}")
+    caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
+               f"└ 🔗 {esc(link)}")
+    share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if en
+                  else f"${sym} {pct:+.1f}% в NDbot 🚀 Купить в один клик:")
+    kb = KB([[B("📤 Поделиться PnL", url=share_url(link, share_text))],
+             [B("🙈 Скрыть", callback_data="w:x:0")]])
+    await q.message.chat.send_photo(png, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
 # ---------------------------------------------------------------- позиции
 async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = await need_wallet(update)
@@ -1804,6 +1879,7 @@ def main():
     app.add_handler(CommandHandler("ref", show_ref))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_ref_cb, pattern=r"^rf:"))
+    app.add_handler(CallbackQueryHandler(on_pnl_share, pattern=r"^pn:"))
     app.add_handler(CallbackQueryHandler(on_order_cb, pattern=r"^lo:"))
     app.add_handler(CallbackQueryHandler(on_cancel_cb, pattern=r"^w:x:"))
     app.add_handler(CallbackQueryHandler(on_wallet_cb, pattern=r"^w:"))
