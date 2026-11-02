@@ -55,7 +55,7 @@ scanner = market.Scanner(rpc)
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
-MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["⚙️ Настройки"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["↗️ Вывод", "⚙️ Настройки"]], resize_keyboard=True)
 _price = {"usd": 0.0, "ts": 0.0}
 
 
@@ -184,7 +184,7 @@ async def wallet_detail(uid: int, wid: int) -> tuple[str, KB] | None:
         [B("📋 Скопировать адрес", copy_text=CopyTextButton(acc))],
         [B("💰 Пополнить", callback_data=f"w:top:{wid}")],
         [B("✅ Основной" if is_active else "⭐ Сделать основным", callback_data=f"w:act:{wid}"),
-         B("Перевод ↗️", callback_data=f"w:tr:{wid}")],
+         B("Вывод ↗️", callback_data=f"w:tr:{wid}")],
         [B("Изменить имя ✍️", callback_data=f"w:ren:{wid}"),
          B("Сид-фраза 🌱" if has_phrase else "Приватный ключ 🔑", callback_data=f"w:seed:{wid}")],
         [B("⬅️ Назад", callback_data="w:list"), B("Удалить 🗑", callback_data=f"w:del:{wid}")],
@@ -393,9 +393,8 @@ async def on_wallet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await edit_or_send(q, text, kb)
     elif act == "tr":
         await q.answer()
-        ctx.user_data["await"] = ("tr_to", wid)
-        await chat.send_message(f"↗️ Перевод NEAR с «{esc(name)}».\nОтправьте адрес получателя (имя.near или 64 символа):",
-                                parse_mode=ParseMode.HTML)
+        await chat.send_message(f"↗️ <b>Вывод</b> с «{esc(name)}»\nЧто выводим?", parse_mode=ParseMode.HTML,
+                                reply_markup=await assets_kb(wid, acc))
 
 
 async def on_cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -407,14 +406,87 @@ async def on_cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ---------------------------------------------------------------- перевод
-async def transfer_to(update: Update, ctx, wid: int, text: str):
+# ---------------------------------------------------------------- вывод (NEAR и токены)
+async def cmd_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = await need_wallet(update)
+    if not s:
+        return
+    wid = db.active_wallet(update.effective_user.id)
+    await update.message.reply_text(f"↗️ <b>Вывод</b> с <code>{esc(short(s.account_id))}</code>\nЧто выводим?",
+                                    parse_mode=ParseMode.HTML, reply_markup=await assets_kb(wid, s.account_id))
+
+
+async def assets_kb(wid: int, acc: str) -> KB:
+    """NEAR + токены с ненулевым балансом из истории сделок кошелька + «другой токен»."""
+    rows = [[B(f"Ⓝ NEAR · {fmt_near(await ref.native_balance(acc))}", callback_data=f"wa:{wid}:n")]]
+    for token in db.traded_tokens(acc)[:12]:
+        try:
+            bal = await ref.ft_balance(token, acc)
+        except RpcError:
+            continue
+        if bal > 0:
+            tid = db.token_id(token)
+            _, sym, dec = db.token_by_id(tid)
+            rows.append([B(f"${sym} · {fmt_tok(bal, dec or 0)}", callback_data=f"wa:{wid}:{tid}")])
+    rows.append([B("➕ Другой токен (адрес контракта)", callback_data=f"wa:{wid}:x")])
+    rows.append([B("Отмена", callback_data="w:x:0")])
+    return KB(rows)
+
+
+async def on_asset_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, wid, what = q.data.split(":")
+    wid = int(wid)
+    await q.answer()
+    if not db.wallet(q.from_user.id, wid):
+        return
+    if what == "x":
+        ctx.user_data["await"] = ("tr_token", wid)
+        await q.edit_message_text("Отправьте адрес контракта токена (например, batman-4.nearlytrade.near):")
+        return
+    token = None if what == "n" else _token_from_cb(what)
+    if what != "n" and not token:
+        await q.edit_message_text("Токен не найден.")
+        return
+    await ask_recipient(q.message.chat, ctx, wid, token, edit=q)
+
+
+async def ask_recipient(chat, ctx, wid: int, token: str | None, edit=None):
+    label = "NEAR"
+    if token:
+        meta = await ref.ft_metadata(token)
+        label = f"${esc(str(meta.get('symbol') or token)[:20])}"
+    ctx.user_data["await"] = ("tr_to", wid, token)
+    text = f"↗️ Вывод {label}\nОтправьте адрес получателя (<code>имя.near</code> или 64 символа):"
+    if edit:
+        await edit.edit_message_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await chat.send_message(text, parse_mode=ParseMode.HTML)
+
+
+async def transfer_token_addr(update: Update, ctx, wid: int, text: str):
+    token = find_token(text)
+    if not token:
+        await update.message.reply_text("❌ Это не адрес токена. Вывод отменён.")
+        return
+    try:
+        meta = await ref.ft_metadata(token)
+    except RpcError:
+        meta = None
+    if not meta or meta.get("decimals") is None:
+        await update.message.reply_text("❌ Это не токен NEAR (нет ft_metadata). Вывод отменён.")
+        return
+    db.token_id(token, str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0))
+    await ask_recipient(update.effective_chat, ctx, wid, token)
+
+
+async def transfer_to(update: Update, ctx, wid: int, token: str | None, text: str):
     to = text.strip().lower()
     if not wallets.ACCOUNT_RE.match(to):
-        await update.message.reply_text("❌ Неверный адрес. Перевод отменён.")
+        await update.message.reply_text("❌ Неверный адрес. Вывод отменён.")
         return
     if len(to) != 64 and not await rpc.account(to):
-        await update.message.reply_text(f"❌ Аккаунта {to} не существует. Перевод отменён.")
+        await update.message.reply_text(f"❌ Аккаунта {to} не существует. Вывод отменён.")
         return
     s = signer_for(update.effective_user.id, wid)
     if not s:
@@ -422,30 +494,63 @@ async def transfer_to(update: Update, ctx, wid: int, text: str):
     if to == s.account_id:
         await update.message.reply_text("❌ Это тот же кошелёк.")
         return
-    bal = await ref.native_balance(s.account_id)
-    ctx.user_data["await"] = ("tr_amt", wid, to)
-    await update.message.reply_text(f"Сколько NEAR отправить? Доступно: <b>{fmt_near(bal)}</b>\n"
-                                    "Число, например <code>1.5</code>, или <code>all</code> — всё.",
-                                    parse_mode=ParseMode.HTML)
+    ctx.user_data["await"] = ("tr_amt", wid, to, token)
+    if token:
+        tid = db.token_id(token)
+        _, sym, dec = db.token_by_id(tid)
+        bal = await ref.ft_balance(token, s.account_id)
+        await update.message.reply_text(f"Сколько ${esc(sym)} отправить? Доступно: <b>{fmt_tok(bal, dec or 0)}</b>\n"
+                                        "Число, процент (<code>50%</code>) или <code>all</code> — всё.",
+                                        parse_mode=ParseMode.HTML)
+    else:
+        bal = await ref.native_balance(s.account_id)
+        await update.message.reply_text(f"Сколько NEAR отправить? Доступно: <b>{fmt_near(bal)}</b>\n"
+                                        "Число, например <code>1.5</code>, процент (<code>50%</code>) или <code>all</code> — всё.",
+                                        parse_mode=ParseMode.HTML)
 
 
-async def transfer_amount(update: Update, ctx, wid: int, to: str, text: str):
+def _parse_amount(text: str, bal: int, dec: int) -> int:
+    t = text.strip().lower().replace(",", ".")
+    if t in ("all", "max", "всё", "все", "100%"):
+        return bal
+    if t.endswith("%"):
+        v = parse_num(t)
+        return int(Decimal(bal) * min(v, Decimal(100)) / 100) if v else 0
+    v = parse_num(t)
+    return int(v * (Decimal(10) ** dec)) if v else 0
+
+
+async def transfer_amount(update: Update, ctx, wid: int, to: str, token: str | None, text: str):
     s = signer_for(update.effective_user.id, wid)
     if not s:
         return
-    bal = await ref.native_balance(s.account_id)
+    nat = await ref.native_balance(s.account_id)
     fee = YOCTO // 100  # 0.01 NEAR на газ
-    if text.strip().lower() in ("all", "max", "всё", "все"):
-        amt = bal - fee
+    if token:
+        tid = db.token_id(token)
+        _, sym, dec = db.token_by_id(tid)
+        dec = dec or 0
+        bal = await ref.ft_balance(token, s.account_id)
+        amt = _parse_amount(text, bal, dec)
+        if amt <= 0 or amt > bal:
+            await update.message.reply_text(f"❌ Неверная сумма. Доступно {fmt_tok(bal, dec)} ${esc(sym)}.")
+            return
+        if nat < fee:
+            await update.message.reply_text(f"❌ Нужно хотя бы 0.01 NEAR на газ, а на кошельке {fmt_near(nat)}.")
+            return
+        what = f"{fmt_tok(amt, dec)} ${esc(sym)}"
     else:
-        v = parse_num(text)
-        amt = to_yocto(v) if v else 0
-    if amt <= 0 or amt > bal - fee:
-        await update.message.reply_text(f"❌ Неверная сумма или не хватает на газ. Доступно {fmt_near(bal)} NEAR.")
-        return
-    ctx.user_data["transfer"] = (wid, to, amt)
+        amt = _parse_amount(text, nat, 24)
+        if text.strip().lower() in ("all", "max", "всё", "все", "100%"):
+            amt = nat - fee
+        if amt <= 0 or amt > nat - fee:
+            await update.message.reply_text(f"❌ Неверная сумма или не хватает на газ. Доступно {fmt_near(nat)} NEAR.")
+            return
+        what = f"{fmt_near(amt)} NEAR"
+    ctx.user_data["transfer"] = (wid, to, amt, token)
     await update.message.reply_text(
-        f"Отправить <b>{fmt_near(amt)} NEAR</b>\nс <code>{esc(short(s.account_id))}</code>\nна <code>{esc(to)}</code>?",
+        f"Вывести <b>{what}</b>\nс <code>{esc(short(s.account_id))}</code>\nна <code>{esc(to)}</code>?\n\n"
+        "Проверьте адрес: перевод в блокчейне нельзя отменить.",
         parse_mode=ParseMode.HTML,
         reply_markup=KB([[B("✅ Отправить", callback_data="tr:ok"), B("Отмена", callback_data="tr:no")]]))
 
@@ -455,17 +560,24 @@ async def on_transfer_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending = ctx.user_data.pop("transfer", None)
     await q.answer()
     if q.data != "tr:ok" or not pending:
-        await q.edit_message_text("Перевод отменён.")
+        await q.edit_message_text("Вывод отменён.")
         return
-    wid, to, amt = pending
+    wid, to, amt, token = pending
     s = signer_for(q.from_user.id, wid)
     if not s:
         await q.edit_message_text("Кошелёк не найден.")
         return
     await q.edit_message_text("⏳ Отправляю…")
     try:
-        res = await ref.withdraw_near(s, to, amt)
-        await q.edit_message_text(f"✅ Отправлено {fmt_near(amt)} NEAR на <code>{esc(to)}</code> · {nb_tx(res['_hash'])}",
+        if token:
+            tid = db.token_id(token)
+            _, sym, dec = db.token_by_id(tid)
+            res = await ref.transfer_ft(s, token, to, amt)
+            what = f"{fmt_tok(amt, dec or 0)} ${esc(sym)}"
+        else:
+            res = await ref.withdraw_near(s, to, amt)
+            what = f"{fmt_near(amt)} NEAR"
+        await q.edit_message_text(f"✅ Отправлено {what} на <code>{esc(to)}</code> · {nb_tx(res['_hash'])}",
                                   parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except (TxFailed, RpcError) as e:
         await q.edit_message_text(f"❌ Ошибка: {esc(str(e)[:300])}", parse_mode=ParseMode.HTML)
@@ -797,7 +909,8 @@ def parse_num(s: str) -> Decimal | None:
         return None
 
 
-MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings}
+MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings,
+                "↗️ Вывод": cmd_withdraw}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -821,10 +934,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             detail = await wallet_detail(uid, pending[1])
             if detail:
                 await update.message.reply_text(detail[0], parse_mode=ParseMode.HTML, reply_markup=detail[1])
+        elif kind == "tr_token":
+            await transfer_token_addr(update, ctx, pending[1], text)
         elif kind == "tr_to":
-            await transfer_to(update, ctx, pending[1], text)
+            await transfer_to(update, ctx, pending[1], pending[2], text)
         elif kind == "tr_amt":
-            await transfer_amount(update, ctx, pending[1], pending[2], text)
+            await transfer_amount(update, ctx, pending[1], pending[2], pending[3], text)
         elif kind == "presets":
             vals = [parse_num(x) for x in text.split()]
             if len(vals) != 4 or not all(vals):
@@ -870,7 +985,7 @@ async def post_init(app: Application):
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
     await app.bot.set_my_commands([("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"),
-                                   ("settings", "Настройки")])
+                                   ("withdraw", "Вывод средств"), ("settings", "Настройки")])
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -890,9 +1005,11 @@ def main():
     app.add_handler(CommandHandler("wallet", show_wallet))
     app.add_handler(CommandHandler("positions", show_positions))
     app.add_handler(CommandHandler("settings", show_settings))
+    app.add_handler(CommandHandler("withdraw", cmd_withdraw))
     app.add_handler(CallbackQueryHandler(on_cancel_cb, pattern=r"^w:x:"))
     app.add_handler(CallbackQueryHandler(on_wallet_cb, pattern=r"^w:"))
     app.add_handler(CallbackQueryHandler(on_transfer_cb, pattern=r"^tr:"))
+    app.add_handler(CallbackQueryHandler(on_asset_cb, pattern=r"^wa:"))
     app.add_handler(CallbackQueryHandler(on_trade_cb, pattern=r"^(b|bx|s|sx|c):"))
     app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

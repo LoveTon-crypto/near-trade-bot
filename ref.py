@@ -265,6 +265,25 @@ class Ref:
             log.warning("unwrap after sell failed: %s", e)
         return {"pool_id": pool_id, "route": r, "got": max(got, 0), "expected": expected, "sold": amount, "hash": res["_hash"]}
 
+    async def transfer_ft(self, s: Signer, token: str, to: str, amount: int) -> dict:
+        """Перевод токена. Если получатель не зарегистрирован в контракте токена — регистрируем его за свой счёт
+        (≈0.00125 NEAR) в той же транзакции, иначе токен не дойдёт."""
+        actions = []
+        reg = await self.rpc.view(token, "storage_balance_of", {"account_id": to})
+        if not reg:
+            try:
+                bounds = await self.rpc.view(token, "storage_balance_bounds")
+                dep = int((bounds or {}).get("min") or DEFAULT_STORAGE)
+            except Exception:
+                dep = DEFAULT_STORAGE
+            if dep > YOCTO // 10:
+                raise TxFailed(f"токен просит необычно большой storage-депозит ({dep / YOCTO} NEAR), отменено")
+            actions.append(FunctionCall("storage_deposit", {"account_id": to, "registration_only": True},
+                                        gas=30 * TGAS, deposit=dep))
+        actions.append(FunctionCall("ft_transfer", {"receiver_id": to, "amount": str(amount)},
+                                    gas=30 * TGAS, deposit=ONE_YOCTO))
+        return await s.send(token, actions)
+
     async def withdraw_near(self, s: Signer, to: str, amount: int) -> dict:
         from near import Transfer
         return await s.send(to, [Transfer(amount)])
