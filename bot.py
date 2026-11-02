@@ -29,6 +29,7 @@ load_dotenv()
 from db import DB
 import market
 import i18n
+import copytrade
 import pnl_card
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
@@ -136,8 +137,8 @@ class I18nBot(ExtBot):
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
-MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "↗️ Вывод"], ["🤝 Рефералы", "⚙️ Настройки"]],
-                           resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "🔁 Копитрейд"], ["↗️ Вывод", "🤝 Рефералы"],
+                            ["⚙️ Настройки"]], resize_keyboard=True)
 _price = {"usd": 0.0, "ts": 0.0}
 
 
@@ -1849,6 +1850,307 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("✅ Картинка добавлена.\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+# ---------------------------------------------------------------- копитрейд
+# Бот слушает сделки выбранных кошельков (copytrade.py, Intear) и повторяет их с кошелька пользователя:
+#   лидер купил токен за NEAR  → покупаем на фикс. сумму или % от его суммы (не больше «макс.»);
+#   лидер продал токен за NEAR → продаём ту же долю своей позиции (если «продажи» включены).
+MAX_COPY = int(os.getenv("MAX_COPY_TARGETS", "10"))
+COPY_SKIP = {"usdt.tether-token.near", "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+             "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near",
+             "dac17f958d2ee523a2206206994597c13d831ec7.factory.bridge.near", "usn", "aurora"}
+COPY_SLIPS = (300, 500, 1000, 2000, 3000)
+HUB: copytrade.Hub | None = None
+APP_BOT = None
+
+
+async def copy_sync():
+    if HUB:
+        await HUB.sync(db.active_leaders())
+
+
+async def on_leader_trade(leader: str, tx: str, deltas: dict, ts: int):
+    near = deltas.get("near", 0)
+    others = [(t, v) for t, v in deltas.items() if t != "near"]
+    if len(others) != 1 or not near:
+        return  # токен ↔ токен или непонятная сделка — не копируем
+    token, tok_delta = others[0]
+    if token in COPY_SKIP:
+        return
+    if near < 0 < tok_delta:
+        side, leader_near = "buy", -near
+    elif tok_delta < 0 < near:
+        side, leader_near = "sell", near
+    else:
+        return
+    frac = 1.0
+    if side == "sell":
+        try:
+            after = await ref.ft_balance(token, leader)
+            sold = -tok_delta
+            frac = 1.0 if after <= sold * 0.05 else sold / (after + sold)
+        except RpcError:
+            frac = 1.0
+    for t in db.copies_of(leader):
+        if db.claim_copy(t["id"], tx, side, token):
+            asyncio.create_task(run_copy(t, side, token, leader_near, frac, tx))
+
+
+async def run_copy(t: dict, side: str, token: str, leader_near: int, frac: float, tx: str):
+    uid = t["user_id"]
+    who = esc(t["name"] or short(t["leader"]))
+
+    async def tell(text, tid=None):
+        kb = KB([[B("📊 Токен", callback_data=f"c:{tid}"), B("🔁 Копитрейд", callback_data=f"ct:v:{t['id']}")]]) if tid else None
+        try:
+            await APP_BOT.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        except Exception as e:
+            log.info("copy notify %s: %s", uid, e)
+
+    s = signer_for(uid, t["wallet_id"]) if t["wallet_id"] else active_signer(uid)
+    if not s:
+        db.copy_done(t["id"], tx, "skip", "нет кошелька")
+        return
+    try:
+        meta = await ref.ft_metadata(token)
+    except RpcError:
+        meta = {}
+    sym, dec = str(meta.get("symbol") or token)[:20], int(meta.get("decimals") or 0)
+    tid = db.token_id(token, sym, dec)
+    head = f"🔁 <b>Копитрейд</b> · {who}\n"
+    key = (s.account_id, token)
+    while key in BUSY:
+        await asyncio.sleep(0.5)
+    BUSY.add(key)
+    try:
+        if side == "buy":
+            if leader_near < to_yocto(t["min_leader"]):
+                db.copy_done(t["id"], tx, "skip", "сделка лидера меньше минимума")
+                return
+            amount = to_yocto(t["amount"]) if t["mode"] == "fixed" else int(leader_near * t["amount"] / 100)
+            amount = min(amount, to_yocto(t["max_near"]), MAX_BUY)
+            if amount < YOCTO // 100:
+                db.copy_done(t["id"], tx, "skip", "сумма меньше 0.01 NEAR")
+                return
+            bal = await ref.native_balance(s.account_id)
+            if amount > bal - GAS_RESERVE:
+                db.copy_done(t["id"], tx, "fail", "мало NEAR")
+                await tell(head + f"Лидер купил <b>${esc(sym)}</b> на {fmt_near(leader_near)} Ⓝ, но на кошельке "
+                                  f"{fmt_near(bal)} Ⓝ — не хватает на {fmt_near(amount)} Ⓝ + газ.", tid)
+                return
+            r = await swap_buy(uid, s, token, amount, t["slippage_bps"])
+            db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
+            db.copy_done(t["id"], tx, "done")
+            await tell(head + f"Лидер купил <b>${esc(sym)}</b> на {fmt_near(leader_near)} Ⓝ\n"
+                              f"✅ Куплено <b>{fmt_tok(r['got'], dec)} ${esc(sym)}</b> за {fmt_near(amount)} Ⓝ · "
+                              f"{nb_tx(r['hash'])}", tid)
+        else:
+            if not t["copy_sells"]:
+                db.copy_done(t["id"], tx, "skip", "продажи выключены")
+                return
+            bal = await ref.ft_balance(token, s.account_id)
+            if bal <= 0:
+                db.copy_done(t["id"], tx, "skip", "токена нет на кошельке")
+                return
+            amount = bal if frac >= 0.95 else int(bal * frac)
+            if amount <= 0:
+                db.copy_done(t["id"], tx, "skip", "нечего продавать")
+                return
+            r = await swap_sell(uid, s, token, amount, t["slippage_bps"])
+            db.add_trade(s.account_id, token, "sell", amount, r["got"], r["hash"])
+            db.copy_done(t["id"], tx, "done")
+            await tell(head + f"Лидер продал {min(frac, 1) * 100:.0f}% <b>${esc(sym)}</b>\n"
+                              f"✅ Продано {fmt_tok(amount, dec)} ${esc(sym)} → <b>{fmt_near(r['got'])} Ⓝ</b> · "
+                              f"{nb_tx(r['hash'])}", tid)
+    except (TxFailed, RpcError, NoPool) as e:
+        db.copy_done(t["id"], tx, "fail", str(e)[:200])
+        act = "покупку" if side == "buy" else "продажу"
+        await tell(head + f"❌ Не удалось повторить {act} <b>${esc(sym)}</b>: {esc(str(e)[:200])}", tid)
+    except Exception as e:
+        log.exception("copy %s %s", t["id"], tx)
+        db.copy_done(t["id"], tx, "fail", type(e).__name__)
+    finally:
+        BUSY.discard(key)
+
+
+def copy_summary(t: dict) -> str:
+    amt = f"{t['amount']:g} Ⓝ" if t["mode"] == "fixed" else f"{t['amount']:g}% от сделки"
+    return (f"{'🟢' if t['active'] else '⏸'} <b>{esc(t['name'] or short(t['leader']))}</b> · "
+            f"<code>{esc(short(t['leader']))}</code>\n"
+            f"   покупка: {amt}, макс. {t['max_near']:g} Ⓝ · продажи: {'да' if t['copy_sells'] else 'нет'}")
+
+
+def copies_view(uid: int) -> tuple[str, KB]:
+    ts = db.user_copies(uid)
+    lines = ["🔁 <b>Копитрейд</b>",
+             "Бот повторяет сделки выбранных кошельков: покупает, когда они покупают, и продаёт ту же долю, "
+             "когда продают."]
+    if ts:
+        lines += [""] + [copy_summary(t) for t in ts]
+    else:
+        lines += ["", "Пока нет кошельков. Добавьте кошелёк трейдера, за которым хотите повторять сделки."]
+    kb = [[B(f"⚙️ {t['name'] or short(t['leader'])}", callback_data=f"ct:v:{t['id']}")] for t in ts]
+    kb.append([B("➕ Добавить кошелёк", callback_data="ct:add")])
+    return "\n".join(lines), KB(kb)
+
+
+def copy_view(uid: int, t: dict) -> tuple[str, KB]:
+    done, failed = db.copy_stats(t["id"])
+    w = db.wallet(uid, t["wallet_id"]) if t["wallet_id"] else None
+    lines = [f"🔁 <b>{esc(t['name'] or short(t['leader']))}</b>", f"<code>{esc(t['leader'])}</code>",
+             f'<a href="https://nearblocks.io/address/{esc(t["leader"])}">Nearblocks</a>', "",
+             f"Статус: {'🟢 активен' if t['active'] else '⏸ на паузе'}",
+             "Покупка: " + (f"<b>{t['amount']:g} Ⓝ</b> на каждую сделку" if t["mode"] == "fixed"
+                            else f"<b>{t['amount']:g}%</b> от суммы сделки лидера"),
+             f"Макс. за сделку: <b>{t['max_near']:g} Ⓝ</b> · пропускать сделки лидера меньше {t['min_leader']:g} Ⓝ",
+             f"Продажи: {'повторять ту же долю' if t['copy_sells'] else 'не повторять'} · "
+             f"slippage {t['slippage_bps'] / 100:g}%",
+             f"Кошелёк: <code>{esc(short(w[2]))}</code>" if w else "Кошелёк: основной",
+             f"Повторено сделок: {done}" + (f" · не удалось: {failed}" if failed else "")]
+    i = t["id"]
+    kb = KB([[B("⏸ Пауза" if t["active"] else "▶️ Включить", callback_data=f"ct:act:{i}")],
+             [B("💰 Фикс. сумма (🔀)" if t["mode"] == "fixed" else "📊 % от сделки (🔀)", callback_data=f"ct:mode:{i}"),
+              B((f"Сумма {t['amount']:g} Ⓝ" if t["mode"] == "fixed" else f"Процент {t['amount']:g}%") + " (✏️)",
+                callback_data=f"ct:amt:{i}")],
+             [B(f"Макс. {t['max_near']:g} Ⓝ (✏️)", callback_data=f"ct:max:{i}"),
+              B(f"Мин. лидера {t['min_leader']:g} Ⓝ (✏️)", callback_data=f"ct:min:{i}")],
+             [B(f"🍌 Slippage {t['slippage_bps'] / 100:g}% (🔀)", callback_data=f"ct:slip:{i}"),
+              B("Продажи: ✅" if t["copy_sells"] else "Продажи: ❌", callback_data=f"ct:sells:{i}")],
+             [B(f"👛 {short(w[2]) if w else 'основной'} (🔀)", callback_data=f"ct:wal:{i}"),
+              B("🏷 Имя (✏️)", callback_data=f"ct:name:{i}")],
+             [B("⬅️ К списку", callback_data="ct:l"), B("🗑 Удалить", callback_data=f"ct:del:{i}")]])
+    return "\n".join(lines), kb
+
+
+async def show_copies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, kb = copies_view(update.effective_user.id)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                              disable_web_page_preview=True)
+
+
+COPY_PROMPTS = {"amt": "Сколько? Для фикс. суммы — NEAR (например 0.5), для режима % — процент от сделки лидера (например 50).",
+                "max": "Максимум NEAR на одну скопированную покупку (например 5):",
+                "min": "Пропускать сделки лидера меньше скольких NEAR? (например 0.5)",
+                "name": "Имя для этого кошелька (до 24 символов):"}
+
+
+async def on_copy_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = q.data.split(":")
+    act = parts[1]
+    chat = q.message.chat
+    if act == "l":
+        await q.answer()
+        await edit_or_send(q, *copies_view(uid))
+        return
+    if act == "add":
+        if not await need_wallet(update):
+            return
+        if len(db.user_copies(uid)) >= MAX_COPY:
+            await q.answer(f"Максимум {MAX_COPY} кошельков", show_alert=True)
+            return
+        await q.answer()
+        ctx.user_data["await"] = ("ct_addr",)
+        await chat.send_message("Отправьте адрес кошелька трейдера (<code>имя.near</code> или 64 символа):",
+                                parse_mode=ParseMode.HTML, reply_markup=KB([[B("🚫 Отмена", callback_data="lo:pc")]]))
+        return
+    t = db.copy_target(uid, int(parts[2])) if len(parts) > 2 and parts[2].isdigit() else None
+    if not t:
+        await q.answer("Не найдено", show_alert=True)
+        return
+    i = t["id"]
+    if act == "act":
+        db.update_copy(uid, i, active=0 if t["active"] else 1)
+        await copy_sync()
+        await q.answer("Включено" if not t["active"] else "На паузе")
+    elif act == "mode":
+        fixed = t["mode"] != "fixed"
+        db.update_copy(uid, i, mode="fixed" if fixed else "pct", amount=0.5 if fixed else 50)
+        await q.answer()
+    elif act == "slip":
+        db.update_copy(uid, i, slippage_bps=next((x for x in COPY_SLIPS if x > t["slippage_bps"]), COPY_SLIPS[0]))
+        await q.answer()
+    elif act == "sells":
+        db.update_copy(uid, i, copy_sells=0 if t["copy_sells"] else 1)
+        await q.answer()
+    elif act == "wal":
+        ws = [w[0] for w in db.wallets(uid)]
+        if ws:
+            cur = t["wallet_id"] if t["wallet_id"] in ws else None
+            db.update_copy(uid, i, wallet_id=ws[(ws.index(cur) + 1) % len(ws)] if cur else ws[0])
+        await q.answer()
+    elif act in COPY_PROMPTS:
+        await q.answer()
+        ctx.user_data["await"] = ("ct_set", i, act)
+        await chat.send_message(COPY_PROMPTS[act])
+        return
+    elif act == "del":
+        await q.answer()
+        await chat.send_message(f"🗑 Удалить копитрейд «{esc(t['name'] or short(t['leader']))}»?", parse_mode=ParseMode.HTML,
+                                reply_markup=KB([[B("Да, удалить", callback_data=f"ct:delok:{i}"),
+                                                  B("Отмена", callback_data="w:x:0")]]))
+        return
+    elif act == "delok":
+        db.delete_copy(uid, i)
+        await copy_sync()
+        await q.answer("Удалён")
+        await edit_or_send(q, *copies_view(uid))
+        return
+    else:
+        await q.answer()
+    t = db.copy_target(uid, i)
+    await edit_or_send(q, *copy_view(uid, t))
+
+
+async def copy_input(update: Update, ctx, pending, text: str):
+    uid = update.effective_user.id
+    kind = pending[0]
+    if kind == "ct_addr":
+        leader = text.strip().lower()
+        if not wallets.ACCOUNT_RE.match(leader):
+            await update.message.reply_text("❌ Неверный адрес кошелька.")
+            return
+        if any(w[2] == leader for w in db.wallets(uid)):
+            await update.message.reply_text("❌ Это ваш собственный кошелёк в боте.")
+            return
+        if len(leader) != 64 and not await rpc.account(leader):
+            await update.message.reply_text(f"❌ Аккаунта {leader} не существует.")
+            return
+        if any(t["leader"] == leader for t in db.user_copies(uid)):
+            await update.message.reply_text("Этот кошелёк уже добавлен.")
+            return
+        cid = db.add_copy(uid, db.active_wallet(uid), leader, "", max(slippage_bps(uid), 1000))
+        await copy_sync()
+        t = db.copy_target(uid, cid)
+        text_, kb = copy_view(uid, t)
+        await update.message.reply_text("✅ Кошелёк добавлен — копитрейд запущен. Настройте сумму ниже.\n\n" + text_,
+                                        parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        return
+    _, cid, field = pending
+    t = db.copy_target(uid, cid)
+    if not t:
+        return
+    if field == "name":
+        db.update_copy(uid, cid, name=" ".join(text.split())[:24])
+    else:
+        v = parse_num(text)
+        if not v:
+            await update.message.reply_text("Неверное число.")
+            return
+        v = float(v)
+        if field == "amt":
+            if t["mode"] == "pct" and v > 1000:
+                await update.message.reply_text("Слишком большой процент (максимум 1000%).")
+                return
+            db.update_copy(uid, cid, amount=v)
+        elif field == "max":
+            db.update_copy(uid, cid, max_near=min(v, MAX_BUY / YOCTO))
+        elif field == "min":
+            db.update_copy(uid, cid, min_leader=v)
+    text_, kb = copy_view(uid, db.copy_target(uid, cid))
+    await update.message.reply_text(text_, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+
+
 # ---------------------------------------------------------------- позиции
 async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = await need_wallet(update)
@@ -1927,7 +2229,8 @@ def parse_num(s: str) -> Decimal | None:
 
 
 MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings,
-                "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders, "🤝 Рефералы": show_ref}
+                "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders, "🤝 Рефералы": show_ref,
+                "🔁 Копитрейд": show_copies}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1951,6 +2254,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             detail = await wallet_detail(uid, pending[1])
             if detail:
                 await update.message.reply_text(detail[0], parse_mode=ParseMode.HTML, reply_markup=detail[1])
+        elif kind in ("ct_addr", "ct_set"):
+            await copy_input(update, ctx, pending, text)
         elif kind == "lo_token":
             await order_token_input(update, ctx, text)
         elif kind in ("lo_amt", "lo_name", "lo_price"):
@@ -2001,11 +2306,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------- запуск
 async def post_init(app: Application):
+    global HUB, APP_BOT
+    APP_BOT = app.bot
+    HUB = copytrade.Hub(on_leader_trade)
+    await copy_sync()
     try:
         await ref.refresh_index()
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
     cmds = [("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"), ("orders", "Лимит-ордера"),
+            ("copy", "Копитрейд"),
             ("withdraw", "Вывод средств"), ("ref", "Рефералы"), ("settings", "Настройки")]
     await app.bot.set_my_commands([(c, i18n.to_en(d)) for c, d in cmds])
     for lc in ("ru", "uk", "be"):
@@ -2032,6 +2342,8 @@ def main():
     app.add_handler(CommandHandler("settings", show_settings))
     app.add_handler(CommandHandler("withdraw", cmd_withdraw))
     app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(CommandHandler("copy", show_copies))
+    app.add_handler(CallbackQueryHandler(on_copy_cb, pattern=r"^ct:"))
     app.add_handler(CommandHandler("ref", show_ref))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_ref_cb, pattern=r"^rf:"))

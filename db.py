@@ -38,6 +38,13 @@ class DB:
         CREATE TABLE IF NOT EXISTS ref_payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, user_id INTEGER,
             amount TEXT NOT NULL, to_account TEXT, tx TEXT, status TEXT NOT NULL DEFAULT 'pending', note TEXT);
         CREATE INDEX IF NOT EXISTS fees_status ON fees(status);
+        CREATE TABLE IF NOT EXISTS copy_targets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            wallet_id INTEGER, leader TEXT NOT NULL, name TEXT, mode TEXT NOT NULL DEFAULT 'fixed',
+            amount REAL NOT NULL DEFAULT 0.5, max_near REAL NOT NULL DEFAULT 5, min_leader REAL NOT NULL DEFAULT 0.1,
+            slippage_bps INTEGER NOT NULL DEFAULT 1000, copy_sells INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1, created INTEGER, UNIQUE(user_id, leader));
+        CREATE TABLE IF NOT EXISTS copy_log (id INTEGER PRIMARY KEY AUTOINCREMENT, target_id INTEGER, tx TEXT,
+            ts INTEGER, side TEXT, token TEXT, status TEXT, note TEXT, UNIQUE(target_id, tx));
         CREATE INDEX IF NOT EXISTS ref_earn_user ON ref_earn(user_id);
         """)
         ucols = {r[1] for r in self.c.execute("PRAGMA table_info(users)")}
@@ -334,3 +341,60 @@ class DB:
                 "users": self.c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
                 "with_ref": self.c.execute("SELECT COUNT(*) FROM users WHERE referrer IS NOT NULL").fetchone()[0],
                 "trades": self.c.execute("SELECT COUNT(*) FROM fees").fetchone()[0]}
+
+    # ------------------------------------------------------------ копитрейд
+    _CT = "id, user_id, wallet_id, leader, name, mode, amount, max_near, min_leader, slippage_bps, copy_sells, active"
+
+    def _ct(self, r):
+        return dict(zip([c.strip() for c in self._CT.split(",")], r)) if r else None
+
+    def add_copy(self, uid, wid, leader, name, slippage_bps) -> int:
+        cur = self.c.execute("INSERT INTO copy_targets (user_id, wallet_id, leader, name, slippage_bps, created) "
+                             "VALUES (?,?,?,?,?,?)", (uid, wid, leader, name, slippage_bps, int(time.time())))
+        self.c.commit()
+        return cur.lastrowid
+
+    def copy_target(self, uid, cid):
+        return self._ct(self.c.execute(f"SELECT {self._CT} FROM copy_targets WHERE id=? AND user_id=?",
+                                       (cid, uid)).fetchone())
+
+    def user_copies(self, uid):
+        return [self._ct(r) for r in self.c.execute(f"SELECT {self._CT} FROM copy_targets WHERE user_id=? ORDER BY id",
+                                                    (uid,))]
+
+    def copies_of(self, leader):
+        return [self._ct(r) for r in self.c.execute(
+            f"SELECT {self._CT} FROM copy_targets WHERE leader=? AND active=1", (leader,))]
+
+    def active_leaders(self) -> set[str]:
+        return {r[0] for r in self.c.execute("SELECT DISTINCT leader FROM copy_targets WHERE active=1")}
+
+    def update_copy(self, uid, cid, **kw):
+        allowed = {"wallet_id", "name", "mode", "amount", "max_near", "min_leader", "slippage_bps", "copy_sells", "active"}
+        for k, v in kw.items():
+            if k in allowed:
+                self.c.execute(f"UPDATE copy_targets SET {k}=? WHERE id=? AND user_id=?", (v, cid, uid))
+        self.c.commit()
+
+    def delete_copy(self, uid, cid):
+        self.c.execute("DELETE FROM copy_targets WHERE id=? AND user_id=?", (cid, uid))
+        self.c.commit()
+
+    def claim_copy(self, cid, tx, side, token) -> bool:
+        """Одна сделка лидера копируется один раз."""
+        try:
+            self.c.execute("INSERT INTO copy_log (target_id, tx, ts, side, token, status) VALUES (?,?,?,?,?,'run')",
+                           (cid, tx, int(time.time()), side, token))
+            self.c.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def copy_done(self, cid, tx, status, note=None):
+        self.c.execute("UPDATE copy_log SET status=?, note=? WHERE target_id=? AND tx=?", (status, note, cid, tx))
+        self.c.commit()
+
+    def copy_stats(self, cid) -> tuple[int, int]:
+        r = self.c.execute("SELECT SUM(status='done'), SUM(status!='done' AND status!='run') FROM copy_log "
+                           "WHERE target_id=?", (cid,)).fetchone()
+        return int(r[0] or 0), int(r[1] or 0)

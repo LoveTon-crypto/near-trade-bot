@@ -259,6 +259,42 @@ EN: dict[str, str] = {
     "❌ Не получилось открыть картинку. Попробуйте другой файл.": "❌ Couldn't open the picture. Try another file.",
     "✅ Картинка добавлена.": "✅ Picture added.", "слишком большое изображение": "image is too large",
 
+    # copytrade
+    "🔁 Копитрейд": "🔁 Copytrade", "Копитрейд": "Copytrade", "🔁 <b>Копитрейд</b>": "🔁 <b>Copytrade</b>",
+    "🔁 <b>Копитрейд</b> · ": "🔁 <b>Copytrade</b> · ",
+    "Бот повторяет сделки выбранных кошельков: покупает, когда они покупают, и продаёт ту же долю, когда продают.":
+        "The bot mirrors the trades of wallets you pick: it buys when they buy and sells the same share when they sell.",
+    "Пока нет кошельков. Добавьте кошелёк трейдера, за которым хотите повторять сделки.":
+        "No wallets yet. Add a trader's wallet whose trades you want to copy.",
+    "   покупка: ": "   buy: ", ", макс. ": ", max ", " Ⓝ · продажи: ": " Ⓝ · sells: ", "да": "yes", "нет": "no",
+    "% от сделки": "% of the trade", "➕ Добавить кошелёк": "➕ Add wallet", "Статус: ": "Status: ",
+    "🟢 активен": "🟢 active", "⏸ на паузе": "⏸ paused", "Покупка: ": "Buy: ",
+    " Ⓝ</b> на каждую сделку": " Ⓝ</b> per trade", "%</b> от суммы сделки лидера": "%</b> of the leader's trade size",
+    "Макс. за сделку: <b>": "Max per trade: <b>", " Ⓝ</b> · пропускать сделки лидера меньше ": " Ⓝ</b> · skip leader trades below ",
+    "Продажи: ": "Sells: ", "повторять ту же долю": "copy the same share", "не повторять": "don't copy",
+    "Кошелёк: основной": "Wallet: main", "основной": "main", "Повторено сделок: ": "Trades copied: ", " · не удалось: ": " · failed: ",
+    "⏸ Пауза": "⏸ Pause", "▶️ Включить": "▶️ Resume", "Включено": "Resumed", "На паузе": "Paused",
+    "💰 Фикс. сумма (🔀)": "💰 Fixed amount (🔀)", "📊 % от сделки (🔀)": "📊 % of trade (🔀)", "Сумма ": "Amount ",
+    "Процент ": "Percent ", "Макс. ": "Max ", "Мин. лидера ": "Leader min ", "Продажи: ✅": "Sells: ✅", "Продажи: ❌": "Sells: ❌",
+    "🏷 Имя (✏️)": "🏷 Name (✏️)", "⬅️ К списку": "⬅️ Back to list", "🗑 Удалить": "🗑 Delete",
+    "🗑 Удалить копитрейд «": "🗑 Delete copytrade «", "Не найдено": "Not found",
+    "Отправьте адрес кошелька трейдера (<code>имя.near</code> или 64 символа):":
+        "Send the trader's wallet address (<code>name.near</code> or 64 characters):",
+    "❌ Неверный адрес кошелька.": "❌ Invalid wallet address.", "❌ Это ваш собственный кошелёк в боте.": "❌ That's your own wallet in the bot.",
+    " не существует.": " doesn't exist.", "Этот кошелёк уже добавлен.": "This wallet is already added.",
+    "✅ Кошелёк добавлен — копитрейд запущен. Настройте сумму ниже.": "✅ Wallet added — copytrade is on. Set the amount below.",
+    "Сколько? Для фикс. суммы — NEAR (например 0.5), для режима % — процент от сделки лидера (например 50).":
+        "How much? For a fixed amount — NEAR (e.g. 0.5); in % mode — percent of the leader's trade (e.g. 50).",
+    "Максимум NEAR на одну скопированную покупку (например 5):": "Maximum NEAR per copied buy (e.g. 5):",
+    "Пропускать сделки лидера меньше скольких NEAR? (например 0.5)": "Skip leader trades below how many NEAR? (e.g. 0.5)",
+    "Имя для этого кошелька (до 24 символов):": "Name for this wallet (up to 24 characters):",
+    "Слишком большой процент (максимум 1000%).": "Percent is too large (max 1000%).", "📊 Токен": "📊 Token",
+    "Лидер купил <b>$": "Leader bought <b>$", "Лидер продал ": "Leader sold ", "❌ Не удалось повторить ": "❌ Couldn't copy the ",
+    "покупку": "buy", "продажу": "sell", " Ⓝ, но на кошельке ": " Ⓝ, but the wallet has ",
+    " Ⓝ — не хватает на ": " Ⓝ — not enough for ", " Ⓝ + газ.": " Ⓝ + gas.",
+    "сделка лидера меньше минимума": "leader trade below minimum", "сумма меньше 0.01 NEAR": "amount below 0.01 NEAR",
+    "мало NEAR": "not enough NEAR", "продажи выключены": "sells are off", "токена нет на кошельке": "no token in the wallet",
+
     # language switch
     "🌐 Язык: Русский": "🌐 Language: English", "✅ Язык: русский": "✅ Language: English",
 }
