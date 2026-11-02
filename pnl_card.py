@@ -143,9 +143,27 @@ def pill(d, box, fill, r=34):
     d.rounded_rectangle(box, radius=r, fill=fill)
 
 
-def coin(d, x, y, r, fill=(0, 0, 0), bg=(255, 255, 255)):
-    d.ellipse((x - r, y - r, x + r, y + r), fill=bg)
-    near_mark(d, x - r * 0.45, y - r * 0.45, r * 0.9, fill, max(2, int(r * 0.22)))
+# NEAR-style "N" (left leg cut at the bottom, right leg cut at the top) in a unit box, y down
+_N_SHAPES = [
+    [(0.16, 0.95), (0.16, 0.05), (0.30, 0.05), (0.30, 0.76)],                 # left leg
+    [(0.16, 0.05), (0.33, 0.05), (0.84, 0.95), (0.67, 0.95)],                 # diagonal
+    [(0.70, 0.24), (0.84, 0.05), (0.84, 0.95), (0.70, 0.95)],                 # right leg
+]
+
+
+def coin(d, x, y, r, fill=(255, 255, 255), bg=(0, 0, 0), ss: int = 4, ring=None):
+    """Монета NEAR: чёрный круг с белой «N» (рисуем с запасом и уменьшаем — без зубцов)."""
+    big = Image.new("RGBA", (2 * r * ss, 2 * r * ss), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(big)
+    bd.ellipse((0, 0, 2 * r * ss - 1, 2 * r * ss - 1), fill=ring or bg)
+    if ring:
+        rw = 2 * ss
+        bd.ellipse((rw, rw, 2 * r * ss - 1 - rw, 2 * r * ss - 1 - rw), fill=bg)
+    k, off = 2 * r * ss * 0.52, 2 * r * ss * 0.24
+    for poly in _N_SHAPES:
+        bd.polygon([(off + px * k, off + py * k) for px, py in poly], fill=fill)
+    small = big.resize((2 * r, 2 * r), Image.LANCZOS)
+    d._image.alpha_composite(small, (int(x - r), int(y - r)))
 
 
 def fmt_amount(v: float) -> str:
@@ -188,7 +206,7 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
     w = d.textlength(pnl_s, font=f) + 62
     x0 = cx - w / 2
     d.text((x0, 342), pnl_s, font=f, fill=(15, 20, 35))
-    coin(d, x0 + w - 24, 374, 22, fill=(255, 255, 255), bg=(15, 20, 35))
+    coin(d, int(x0 + w - 24), 374, 24)
 
     rows = [("INVESTED", "****" if hide else fmt_amount(initial)), ("WORTH", "****" if hide else fmt_amount(worth))]
     y = 448
@@ -196,7 +214,7 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
         d.text((left, y), label, font=font(40), fill=(255, 255, 255))
         vw = d.textlength(val, font=font(40))
         d.text((right - 58 - vw, y), val, font=font(40), fill=(255, 255, 255))
-        coin(d, right - 22, y + 24, 21, fill=(255, 255, 255), bg=(26, 140, 255))
+        coin(d, right - 22, y + 24, 22, ring=(255, 255, 255))
         y += 62
     if hold:
         d.text((left, y + 4), "HOLD", font=font(28), fill=(200, 210, 230))
