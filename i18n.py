@@ -235,7 +235,7 @@ EN: dict[str, str] = {
     "❌ Это не токен NEAR или сеть перегружена. Попробуйте ещё раз.": "❌ That's not a NEAR token or the network is busy. Try again.",
 
     # PnL share
-    "📤 Поделиться PnL": "📤 Share PnL", "🙈 Скрыть": "🙈 Hide", "🎨 Рисую карточку…": "🎨 Drawing the card…",
+    "📤 Поделиться PnL": "📤 Share PnL", "👁 Показать суммы": "👁 Show amounts", "🙈 Скрыть суммы": "🙈 Hide amounts", "🙈 Скрыть": "🙈 Hide", "🎨 Рисую карточку…": "🎨 Drawing the card…",
     "Нет открытой позиции по этому токену": "No open position in this token",
     "⏳ Не удалось получить цену, попробуйте через пару секунд.": "⏳ Couldn't get the price, try again in a couple of seconds.",
     "🤝 Делись с друзьями и получай до ": "🤝 Share with friends and earn up to ", "% комиссий!": "% of fees!",

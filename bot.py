@@ -28,7 +28,7 @@ load_dotenv()
 from db import DB
 import market
 import i18n
-import pnl_art
+import pnl_card
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
 import wallets
@@ -1699,9 +1699,12 @@ def share_url(link: str, text: str) -> str:
 
 
 async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """pn:<tid> — новая карточка; pn:<tid>:h / pn:<tid>:s — перерисовать со скрытыми / открытыми суммами."""
     q = update.callback_query
     uid = q.from_user.id
-    token = _token_from_cb(q.data.split(":")[1])
+    parts = q.data.split(":")
+    token = _token_from_cb(parts[1])
+    hide = len(parts) > 2 and parts[2] == "h"
     s = active_signer(uid)
     if not token or not s:
         await q.answer("Токен не найден", show_alert=True)
@@ -1713,7 +1716,6 @@ async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer("🎨 Рисую карточку…")
     tid = db.token_id(token)
     _, sym, dec = db.token_by_id(tid)
-    meta = await ref.ft_metadata(token)
     try:
         bal = await ref.ft_balance(token, s.account_id)
         val = await ref.quote_route(await ref.route(token), token, bal, WNEAR) if bal else 0
@@ -1724,19 +1726,22 @@ async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     worth = got + val
     pct = (worth / spent - 1) * 100
     hold = hold_fmt(time.time() - pos["since"]) if pos["since"] else ""
+    code = db.ref_code(uid)
     link = buy_link(ctx.bot.username, uid, tid)
-    en = lang_of(uid) == "en"
-    png = await asyncio.to_thread(
-        pnl_art.render_position, sym or "?", str(meta.get("name") or "")[:28], pct, spent / YOCTO, worth / YOCTO, hold,
-        "NEAR", "NDBOT", f"Earn up to {REF_SHARES[0] if REF_SHARES else 0}% from each friend",
-        f"t.me/{ctx.bot.username}")
+    png = await asyncio.to_thread(pnl_card.render, sym or "?", pct, spent / YOCTO, worth / YOCTO, hold, code,
+                                  "NDBOT", hide)
     caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
                f"└ 🔗 {esc(link)}")
-    share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if en
+    share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if lang_of(uid) == "en"
                   else f"${sym} {pct:+.1f}% в NDbot 🚀 Купить в один клик:")
     kb = KB([[B("📤 Поделиться PnL", url=share_url(link, share_text))],
+             [B("👁 Показать суммы", callback_data=f"pn:{tid}:s") if hide
+              else B("🙈 Скрыть суммы", callback_data=f"pn:{tid}:h")],
              [B("🙈 Скрыть", callback_data="w:x:0")]])
-    await q.message.chat.send_photo(png, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    if len(parts) > 2 and q.message.photo:
+        await q.message.edit_media(InputMediaPhoto(png, caption=caption, parse_mode=ParseMode.HTML), reply_markup=kb)
+    else:
+        await q.message.chat.send_photo(png, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ---------------------------------------------------------------- позиции

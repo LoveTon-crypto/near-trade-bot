@@ -1,1 +1,2 @@
-Put your own winning-PnL pictures (.png/.jpg) here — the bot picks one at random.
+Свои картинки для PnL-карточек в профите: .png (лучше с прозрачным фоном, ~600x660), .jpg, .webp.
+Бот выбирает их случайно (8 из 10 карточек), остальные — встроенные персонажи.
