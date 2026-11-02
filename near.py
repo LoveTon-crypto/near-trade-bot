@@ -163,6 +163,7 @@ class Rpc:
     def __init__(self, urls: list[str], api_key: str = ""):
         self.urls = urls
         self.api_key = api_key
+        self._rr = 0  # по кругу: нагрузка делится между бесплатными узлами, лимит каждого не выбивается
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(20.0, read=70.0),
                                       headers={"User-Agent": "near-trade-bot/1.0"})
 
@@ -178,8 +179,10 @@ class Rpc:
 
     async def call(self, method: str, params) -> dict:
         last = None
+        self._rr = (self._rr + 1) % len(self.urls)
+        order = self.urls[self._rr:] + self.urls[:self._rr]
         for attempt in range(3):
-            for url in self.urls:
+            for url in order:
                 try:
                     r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
                                              headers=self._headers(url))

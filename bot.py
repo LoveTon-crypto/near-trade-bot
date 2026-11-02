@@ -33,8 +33,8 @@ log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 RPC_URLS = [u.strip() for u in os.getenv(
-    "RPC_URLS", "https://rpc.mainnet.fastnear.com,https://near.lava.build,https://free.rpc.fastnear.com,"
-                "https://rpc.mainnet.near.org").split(",") if u.strip()]
+    "RPC_URLS", "https://free.rpc.fastnear.com,https://rpc.intea.rs,https://near.drpc.org,https://1rpc.io/near,"
+                "https://near.lava.build,https://rpc.shitzuapes.xyz").split(",") if u.strip()]
 FASTNEAR_API_KEY = os.getenv("FASTNEAR_API_KEY", "").strip()
 MAX_BUY = to_yocto(os.getenv("MAX_BUY_NEAR", "100"))
 GAS_RESERVE = to_yocto(os.getenv("GAS_RESERVE_NEAR", "0.1"))
