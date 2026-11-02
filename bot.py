@@ -1196,6 +1196,26 @@ async def on_order_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = orders_view(uid)
         await edit_or_send(q, text, kb)
         return
+    if act == "add":
+        if not await need_wallet(update):
+            return
+        await q.answer()
+        ctx.user_data["await"] = ("lo_token",)
+        await chat.send_message("💬 Отправьте адрес токена (или ссылку nearly / justhoot / nearblocks), на который хотите "
+                                "поставить лимит-ордер:", reply_markup=KB([[B("🚫 Отмена", callback_data="lo:pc")]]))
+        return
+    if act == "stop":
+        n = len(db.user_orders(uid))
+        await q.answer()
+        await chat.send_message(f"🛑 Отменить все активные ордера ({n})?", reply_markup=KB(
+            [[B("Да, отменить все", callback_data="lo:stopok"), B("Отмена", callback_data="w:x:0")]]))
+        return
+    if act == "stopok":
+        n = db.cancel_all_orders(uid)
+        await q.answer(f"Отменено: {n}")
+        text, kb = orders_view(uid)
+        await edit_or_send(q, text, kb)
+        return
     if act == "o":
         await q.answer()
         o = db.order(uid, int(parts[2]))
@@ -1366,14 +1386,16 @@ def orders_view(uid: int) -> tuple[str, KB]:
     act = db.user_orders(uid)
     if not act:
         recent = db.user_orders(uid, active_only=False, limit=5)
-        text = "📋 <b>Лимит-ордера</b>\n\nАктивных ордеров нет. Откройте токен (пришлите контракт) и нажмите «📋 Лимит-ордер»."
+        text = "📋 <b>Лимит-ордера</b>\n\nАктивных ордеров нет. Нажмите «➕ Новый ордер» или откройте токен и нажмите «📋 Лимит-ордер»."
         if recent:
             text += "\n\n<b>Последние:</b>\n\n" + "\n\n".join(order_text(o) for o in recent)
-        return text, None
+        return text, KB([[B("➕ Новый ордер", callback_data="lo:add")]])
     text = f"📋 <b>Активные лимит-ордера</b> ({len(act)}/{MAX_ORDERS})\n\n" + "\n\n".join(order_text(o) for o in act)
     if len(text) > 3800:
         text = text[:3800] + "…"
-    kb = [[B(f"#{o['id']} — открыть / отменить", callback_data=f"lo:o:{o['id']}")] for o in act[:12]]
+    kb = [[B("➕ Новый ордер", callback_data="lo:add")]]
+    kb += [[B(f"#{o['id']} — открыть / отменить", callback_data=f"lo:o:{o['id']}")] for o in act[:12]]
+    kb.append([B("🛑 Остановить все", callback_data="lo:stop")])
     return text, KB(kb)
 
 
@@ -1381,6 +1403,27 @@ async def show_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text, kb = orders_view(update.effective_user.id)
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
                                               disable_web_page_preview=True)
+
+
+async def order_token_input(update: Update, ctx, text: str):
+    uid = update.effective_user.id
+    token = find_token(text)
+    if not token:
+        ctx.user_data["await"] = ("lo_token",)
+        await update.message.reply_text("❌ Это не адрес токена. Пришлите адрес контракта, например batman-4.nearlytrade.near")
+        return
+    try:
+        meta = await ref.ft_metadata(token)
+        await ref.route(token)
+    except NoPool:
+        await update.message.reply_text("⚠️ Пула с NEAR для этого токена нет — лимит-ордер поставить нельзя.")
+        return
+    except RpcError:
+        await update.message.reply_text("❌ Это не токен NEAR или сеть перегружена. Попробуйте ещё раз.")
+        return
+    tid = db.token_id(token, str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0))
+    ctx.user_data["lo_draft"] = new_draft(uid, tid)
+    await send_draft(uid, update.effective_chat, ctx)
 
 
 async def order_input(update: Update, ctx, kind: str, text: str):
@@ -1797,6 +1840,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             detail = await wallet_detail(uid, pending[1])
             if detail:
                 await update.message.reply_text(detail[0], parse_mode=ParseMode.HTML, reply_markup=detail[1])
+        elif kind == "lo_token":
+            await order_token_input(update, ctx, text)
         elif kind in ("lo_amt", "lo_name", "lo_price"):
             await order_input(update, ctx, kind, text)
         elif kind == "tr_token":

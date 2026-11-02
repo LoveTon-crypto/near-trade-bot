@@ -223,6 +223,17 @@ EN: dict[str, str] = {
     "сид-фраза с ошибкой: проверьте слова и их порядок": "invalid seed phrase: check the words and their order",
     "это не сид-фраза и не приватный ключ ed25519:…": "this is neither a seed phrase nor an ed25519:… private key",
 
+    "Активных ордеров нет. Нажмите «➕ Новый ордер» или откройте токен и нажмите «📋 Лимит-ордер».":
+        "No active orders. Tap «➕ New order» or open a token and tap «📋 Limit order».",
+    "➕ Новый ордер": "➕ New order", "🛑 Остановить все": "🛑 Stop all",
+    "💬 Отправьте адрес токена (или ссылку nearly / justhoot / nearblocks), на который хотите поставить лимит-ордер:":
+        "💬 Send the token address (or a nearly / justhoot / nearblocks link) you want to place a limit order on:",
+    "🛑 Отменить все активные ордера (": "🛑 Cancel all active orders (", ")?": ")?",
+    "Да, отменить все": "Yes, cancel all", "Отменено: ": "Cancelled: ",
+    "❌ Это не адрес токена. Пришлите адрес контракта, например batman-4.nearlytrade.near":
+        "❌ That's not a token address. Send a contract address, e.g. batman-4.nearlytrade.near",
+    "❌ Это не токен NEAR или сеть перегружена. Попробуйте ещё раз.": "❌ That's not a NEAR token or the network is busy. Try again.",
+
     # PnL share
     "📤 Поделиться PnL": "📤 Share PnL", "🙈 Скрыть": "🙈 Hide", "🎨 Рисую карточку…": "🎨 Drawing the card…",
     "Нет открытой позиции по этому токену": "No open position in this token",

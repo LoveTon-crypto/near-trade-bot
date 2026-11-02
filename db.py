@@ -202,6 +202,12 @@ class DB:
         self.c.commit()
         return cur.rowcount == 1
 
+    def cancel_all_orders(self, uid) -> int:
+        cur = self.c.execute("UPDATE orders SET status='cancelled', done_ts=? WHERE user_id=? AND status='active'",
+                             (int(time.time()), uid))
+        self.c.commit()
+        return cur.rowcount
+
     def reset_stuck_orders(self):
         """После перезапуска: ордера, которые были в процессе исполнения, помечаем — проверить вручную."""
         self.c.execute("UPDATE orders SET status='failed', note='бот перезапустился во время исполнения — проверьте "
