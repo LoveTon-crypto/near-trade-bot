@@ -112,12 +112,38 @@ def character(win: bool, rng: random.Random, user_pics: list[str] | None = None,
         except Exception:
             pass
     pics = pnl_art.custom_images(win)
-    if pics and rng.random() < 0.8:
+    if pics:  # стандартный набор (pnl_images) — всегда, если есть; встроенные персонажи — только запасной вариант
         try:
             return open_pic(rng.choice(pics))
         except Exception:
             pass
     return builtin_character(win, rng)
+
+
+def chart_line(img: Image.Image, win: bool, rng: random.Random):
+    color = (25, 240, 160) if win else (255, 60, 90)
+    n, x0, x1 = 26, 30, 770
+    y_start, y_end = (700, 230) if win else (230, 700)
+    pts, y = [], y_start
+    for i in range(n + 1):
+        x = x0 + (x1 - x0) * i / n
+        trend = y_start + (y_end - y_start) * i / n
+        y = trend + rng.uniform(-60, 60) if 0 < i < n else trend
+        pts.append((x, y))
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    area = pts + [(x1, H), (x0, H)]
+    ld.polygon(area, fill=color + (38,))
+    ld.line(pts, fill=color + (255,), width=16, joint="curve")
+    glow = layer.filter(ImageFilter.GaussianBlur(14))
+    img.alpha_composite(glow)
+    sharp = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(sharp)
+    sd.polygon(area, fill=color + (30,))
+    sd.line(pts, fill=color + (235,), width=7, joint="curve")
+    tip = pts[-1]
+    sd.ellipse((tip[0] - 11, tip[1] - 11, tip[0] + 11, tip[1] + 11), fill=color + (255,))
+    img.alpha_composite(sharp)
 
 
 def fit(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -187,6 +213,9 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
     # logo
     d.text((70, 52), brand[:2], font=font(64), fill=t["accent"])
     d.text((70 + d.textlength(brand[:2], font=font(64)), 52), brand[2:], font=font(64), fill=t["logo"])
+
+    # chart line behind the character: green up for profit, red down for loss
+    chart_line(img, win, rng)
 
     # character (left)
     ch = fit(character(win, rng, (user_pics or {}).get(win), only_user), 600, 660)
