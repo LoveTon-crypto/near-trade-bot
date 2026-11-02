@@ -21,6 +21,14 @@ class DB:
                                             has_phrase INTEGER, created INTEGER,
                                             UNIQUE(user_id, account));
         """)
+        self.c.executescript("""
+        CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            wallet_id INTEGER NOT NULL, token TEXT NOT NULL, side TEXT NOT NULL, cond TEXT NOT NULL,
+            unit TEXT NOT NULL, target REAL NOT NULL, amount TEXT, pct REAL, slippage_bps INTEGER NOT NULL,
+            name TEXT, status TEXT NOT NULL DEFAULT 'active', created INTEGER, done_ts INTEGER,
+            tx TEXT, note TEXT);
+        CREATE INDEX IF NOT EXISTS orders_status ON orders(status);
+        """)
         cols = {r[1] for r in self.c.execute("PRAGMA table_info(trades)")}
         if "account" not in cols:  # trades from the single-wallet version
             self.c.execute("ALTER TABLE trades ADD COLUMN account TEXT")
@@ -113,3 +121,56 @@ class DB:
             else:
                 got += int(near)
         return spent, got
+
+    # limit orders
+    #   side: buy|sell · cond: le (цена ≤ цели) | ge (цена ≥ цели)
+    #   unit: near (цена токена в NEAR) | usd (цена в $) | mc (капитализация в $) · target — в этой единице
+    #   amount: NEAR (yocto) для покупки · pct: % баланса токена для продажи
+    def add_order(self, uid, wid, token, side, cond, unit, target, amount, pct, slippage_bps, name) -> int:
+        cur = self.c.execute(
+            "INSERT INTO orders (user_id, wallet_id, token, side, cond, unit, target, amount, pct, slippage_bps, name,"
+            " status, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,'active',?)",
+            (uid, wid, token, side, cond, unit, float(target), str(amount) if amount else None, pct, slippage_bps,
+             name, int(time.time())))
+        self.c.commit()
+        return cur.lastrowid
+
+    _ORDER_COLS = "id, user_id, wallet_id, token, side, cond, unit, target, amount, pct, slippage_bps, name, status, created, tx, note"
+
+    def _order_row(self, r):
+        return dict(zip([c.strip() for c in self._ORDER_COLS.split(",")], r)) if r else None
+
+    def order(self, uid, oid):
+        return self._order_row(self.c.execute(f"SELECT {self._ORDER_COLS} FROM orders WHERE id=? AND user_id=?",
+                                              (oid, uid)).fetchone())
+
+    def user_orders(self, uid, active_only=True, limit=20):
+        q = f"SELECT {self._ORDER_COLS} FROM orders WHERE user_id=?" + (" AND status='active'" if active_only else "")
+        return [self._order_row(r) for r in self.c.execute(q + " ORDER BY id DESC LIMIT ?", (uid, limit))]
+
+    def active_orders(self):
+        return [self._order_row(r) for r in self.c.execute(
+            f"SELECT {self._ORDER_COLS} FROM orders WHERE status='active' ORDER BY id")]
+
+    def claim_order(self, oid) -> bool:
+        """active → executing атомарно: один ордер не исполнится дважды."""
+        cur = self.c.execute("UPDATE orders SET status='executing' WHERE id=? AND status='active'", (oid,))
+        self.c.commit()
+        return cur.rowcount == 1
+
+    def finish_order(self, oid, status, tx=None, note=None):
+        self.c.execute("UPDATE orders SET status=?, done_ts=?, tx=?, note=? WHERE id=?",
+                       (status, int(time.time()), tx, note, oid))
+        self.c.commit()
+
+    def cancel_order(self, uid, oid) -> bool:
+        cur = self.c.execute("UPDATE orders SET status='cancelled', done_ts=? WHERE id=? AND user_id=? AND status='active'",
+                             (int(time.time()), oid, uid))
+        self.c.commit()
+        return cur.rowcount == 1
+
+    def reset_stuck_orders(self):
+        """После перезапуска: ордера, которые были в процессе исполнения, помечаем — проверить вручную."""
+        self.c.execute("UPDATE orders SET status='failed', note='бот перезапустился во время исполнения — проверьте "
+                       "баланс' WHERE status='executing'")
+        self.c.commit()

@@ -55,7 +55,8 @@ scanner = market.Scanner(rpc)
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
-MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["↗️ Вывод", "⚙️ Настройки"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "↗️ Вывод"], ["⚙️ Настройки"]],
+                           resize_keyboard=True)
 _price = {"usd": 0.0, "ts": 0.0}
 
 
@@ -594,7 +595,7 @@ def k_usd(x: float) -> str:
 
 def near_px(x: float) -> str:
     """Цена в NEAR с «маленькими нулями», как в сканерах: 0.0₄1314."""
-    return market.price_fmt(x)[1:] if x else "0"
+    return market.price_fmt(float(f"{x:.6g}"))[1:] if x else "0"  # .6g: 0.0014 не превращается в 0.001399
 
 
 async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
@@ -702,6 +703,7 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
         [B("🟢 ✏️ X Ⓝ", callback_data=f"bx:{tid}"), B("🔄 Обновить", callback_data=f"c:{tid}")],
         [B("🔴 25%", callback_data=f"s:25:{tid}"), B("🔴 50%", callback_data=f"s:50:{tid}"),
          B("🔴 100%", callback_data=f"s:100:{tid}"), B("🔴 ✏️ X%", callback_data=f"sx:{tid}")],
+        [B("📋 Лимит-ордер", callback_data=f"lo:new:{tid}")],
     ])
     return "\n".join(lines), kb, png
 
@@ -841,6 +843,488 @@ async def on_trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await chat.send_message("Какой % продать? Например: 30")
 
 
+# ---------------------------------------------------------------- лимит-ордера (как в DTrade)
+# Бот сам следит за ценой (раз в ORDER_POLL_SEC) и, когда условие выполнено, делает рыночный свап.
+#   Покупка · базовый  — купить, когда цена упала до цели (≤)
+#   Покупка · пробой   — купить, когда цена выросла до цели (≥)
+#   Продажа · базовый  — тейк-профит: продать, когда цена выросла до цели (≥)
+#   Продажа · стоп-лосс — продать, когда цена упала до цели (≤)
+ORDER_POLL = int(os.getenv("ORDER_POLL_SEC", "10"))
+MAX_ORDERS = int(os.getenv("MAX_ORDERS", "20"))
+UNIT_LABEL = {"near": "в NEAR", "pct": "в %", "usd": "в $", "mc": "в MC $"}
+SLIP_STEPS = (100, 300, 500, 1000, 2000, 3000)
+PCT_STEPS = (25, 50, 75, 100)
+
+
+def order_cond(side: str, mode: str) -> str:
+    return {("buy", "basic"): "le", ("buy", "stop"): "ge", ("sell", "basic"): "ge", ("sell", "stop"): "le"}[(side, mode)]
+
+
+def mode_label(side: str, mode: str) -> str:
+    if mode == "basic":
+        return "⚪ Базовые" if side == "buy" else "⚪ Тейк-профит"
+    return "🚀 Пробой" if side == "buy" else "🛑 Стоп-лосс"
+
+
+def fmt_unit(unit: str, v: float) -> str:
+    if unit == "pct":
+        return f"{v:+g}%"
+    if unit == "near":
+        return f"{near_px(v)} Ⓝ"
+    if unit == "usd":
+        return market.price_fmt(float(f"{v:.6g}"))
+    return k_usd(v)
+
+
+async def token_state(token: str) -> dict:
+    """Цена токена сейчас: в NEAR (из пула), в $ и капитализация."""
+    meta = await ref.ft_metadata(token)
+    dec = int(meta.get("decimals") or 0)
+    route = await ref.route(token)
+    px, usd, supply = await asyncio.gather(ref.spot_price(route, token, dec), near_usd(), ref.total_supply(token))
+    sup = supply / 10 ** dec if dec else float(supply)
+    return {"dec": dec, "sym": str(meta.get("symbol") or "?")[:20], "route": route, "near": px,
+            "usd": px * usd, "mc": px * usd * sup, "near_usd": usd, "supply": sup}
+
+
+def in_unit(st: dict, unit: str) -> float:
+    return st["near"] if unit == "near" else st["usd"] if unit == "usd" else st["mc"]
+
+
+def target_to(st: dict, unit: str, value: float, to: str) -> float:
+    """Пересчёт цели из одной единицы в другую по текущим NEAR/$ и supply."""
+    if unit == "pct":
+        near = st["near"] * (1 + value / 100)
+    elif unit == "near":
+        near = value
+    elif unit == "usd":
+        near = value / st["near_usd"] if st["near_usd"] else 0
+    else:
+        near = value / st["near_usd"] / st["supply"] if st["near_usd"] and st["supply"] else 0
+    return near if to == "near" else near * st["near_usd"] if to == "usd" else near * st["near_usd"] * st["supply"]
+
+
+def new_draft(uid: int, tid: int) -> dict:
+    return {"tid": tid, "side": "buy", "mode": "basic", "wid": db.active_wallet(uid), "unit": "pct", "value": None,
+            "amount": presets(uid)[0], "pct": 100, "slip": slippage_bps(uid), "name": ""}
+
+
+async def draft_view(uid: int, d: dict) -> tuple[str, KB]:
+    token = _token_from_cb(str(d["tid"]))
+    st = await token_state(token)
+    side, mode = d["side"], d["mode"]
+    w = db.wallet(uid, d["wid"]) if d["wid"] else None
+    acc = w[2] if w else None
+    lines = [f"📋 <b>Лимит-ордер</b> · <b>${esc(st['sym'])}</b>", f"<code>{esc(token)}</code>",
+             f"💲 Сейчас: {near_px(st['near'])} Ⓝ ({market.price_fmt(st['usd'])}) · MC {k_usd(st['mc'])}", ""]
+    kind = ("📈 Покупка" if side == "buy" else "📉 Продажа") + " · " + mode_label(side, mode)[2:]
+    lines.append(f"🧬 Тип: <b>{kind}</b>")
+    cond = order_cond(side, mode)
+    if d["value"] is not None:
+        t_near = target_to(st, d["unit"], d["value"], "near")
+        sign = "≤" if cond == "le" else "≥"
+        diff = (t_near / st["near"] - 1) * 100 if st["near"] else 0
+        lines.append(f"🎯 Сработает, когда цена {sign} цели ({diff:+.1f}% от текущей)")
+        lines.append(f"💰 Лимитная цена: ≈{near_px(t_near)} Ⓝ ({market.price_fmt(target_to(st, 'near', t_near, 'usd'))})")
+        lines.append(f"📈 Лимитная MC: ≈{k_usd(target_to(st, 'near', t_near, 'mc'))}")
+        if (cond == "le" and st["near"] <= t_near) or (cond == "ge" and st["near"] >= t_near):
+            lines.append("⚠️ Цена уже на цели — ордер исполнится сразу после создания.")
+    else:
+        lines.append("🎯 Цена не задана — нажмите «Цена»")
+    lines.append(f"🍌 Slippage: {d['slip'] / 100:g}%")
+    if side == "buy":
+        lines.append(f"Ⓝ Сумма: <b>{esc(d['amount'])} Ⓝ</b>"
+                     + (f" ≈${float(d['amount']) * st['near_usd']:,.2f}" if st["near_usd"] else ""))
+    else:
+        lines.append(f"📊 Продать: <b>{d['pct']:g}%</b> баланса токена в момент срабатывания")
+    if d["name"]:
+        lines.append(f"🏷 {esc(d['name'])}")
+    if acc:
+        nat, tb = await asyncio.gather(ref.native_balance(acc), ref.ft_balance(token, acc))
+        lines += ["", f"👛 <b>Баланс</b> {esc(short(acc))}",
+                  f"└ {fmt_near(nat)} Ⓝ" + (f" (${nat / YOCTO * st['near_usd']:,.2f})" if st["near_usd"] else ""),
+                  f"   └ ${esc(st['sym'])} {fmt_tok(tb, st['dec'])}"]
+    kb = [[B("🔄 Обновить", callback_data="lo:r")],
+          [B(f"🏷 Название: {d['name'][:16] or 'не задано'} (✏️)", callback_data="lo:name")],
+          [B(("📈 Покупка" if side == "buy" else "📉 Продажа") + " (🔀)", callback_data="lo:side")],
+          [B(f"👛 {short(acc) if acc else 'нет кошелька'} (🔀)", callback_data="lo:wal")],
+          [B("💰 Цена: " + (fmt_unit(d["unit"], d["value"]) if d["value"] is not None else "—") + " (✏️)",
+             callback_data="lo:price")],
+          [B(f"Ⓝ Сумма {d['amount']} (✏️)", callback_data="lo:amt") if side == "buy"
+           else B(f"📊 Процент {d['pct']:g}% (🔀)", callback_data="lo:pct"),
+           B(f"🍌 Slippage {d['slip'] / 100:g}% (🔀)", callback_data="lo:slip")],
+          [B(mode_label(side, mode) + " (🔀)", callback_data="lo:mode")],
+          [B("✅ Создать ордер", callback_data="lo:ok") if d["value"] is not None
+           else B("💬 Введите цену", callback_data="lo:price"), B("🚫 Отмена", callback_data="lo:x")]]
+    return "\n".join(lines), KB(kb)
+
+
+def price_prompt(d: dict) -> tuple[str, KB]:
+    up = (d["side"] == "sell") == (d["mode"] == "basic")  # тейк-профит и пробой — цель выше текущей
+    steps = (10, 25, 50, 75, 150, 200) if up else (-10, -20, -25, -50, -75, -90)
+    unit = d.get("pu", "pct")
+    act = "купить" if d["side"] == "buy" else "продать"
+    hint = {"pct": "изменение цены в % от текущей (например, " + ("50" if up else "-30") + ")",
+            "near": "цену 1 токена в NEAR (например, 0.0005)", "usd": "цену 1 токена в $ (например, 0.00012)",
+            "mc": "капитализацию в $ (например, 50000 или 50k)"}[unit]
+    text = f"💬 Введи {hint}, при которой {act} токен, или выбери кнопку:"
+    rows = [[B(f"{'+' if s > 0 else '−'} {abs(s)}%", callback_data=f"lo:pp:{s}") for s in steps[:3]],
+            [B(f"{'+' if s > 0 else '−'} {abs(s)}%", callback_data=f"lo:pp:{s}") for s in steps[3:]],
+            [B(("✅ " if unit == u else "☑️ ") + UNIT_LABEL[u], callback_data=f"lo:pu:{u}") for u in ("near", "pct")],
+            [B(("✅ " if unit == u else "☑️ ") + UNIT_LABEL[u], callback_data=f"lo:pu:{u}") for u in ("usd", "mc")],
+            [B("🚫 Отмена", callback_data="lo:pc")]]
+    return text, KB(rows)
+
+
+def parse_value(text: str, unit: str) -> float | None:
+    t = text.strip().lower().replace(",", ".").replace("$", "").replace(" ", "").rstrip("%")
+    mult = 1
+    if unit in ("mc", "usd") and t[-1:] in ("k", "m", "к", "м"):
+        mult = 1e3 if t[-1] in "kк" else 1e6
+        t = t[:-1]
+    try:
+        v = float(Decimal(t)) * mult
+    except (InvalidOperation, ValueError):
+        return None
+    if unit != "pct" and v <= 0:
+        return None
+    return v
+
+
+async def send_draft(uid: int, chat, ctx, edit_q=None):
+    d = ctx.user_data.get("lo_draft")
+    if not d:
+        return
+    try:
+        text, kb = await draft_view(uid, d)
+    except NoPool:
+        text, kb = "⚠️ Пула с NEAR для этого токена нет — лимит-ордер поставить нельзя.", None
+    except RpcError:
+        text, kb = "⏳ Сеть NEAR перегружена, попробуйте через пару секунд.", KB([[B("🔄 Обновить", callback_data="lo:r")]])
+    if edit_q:
+        try:
+            await edit_q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        except Exception as e:
+            if "not modified" in str(e):
+                return
+    await chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def on_order_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = q.data.split(":")
+    act = parts[1]
+    chat = q.message.chat
+
+    # --- список ордеров и отмена
+    if act == "l":
+        await q.answer()
+        text, kb = orders_view(uid)
+        await edit_or_send(q, text, kb)
+        return
+    if act == "o":
+        await q.answer()
+        o = db.order(uid, int(parts[2]))
+        if not o:
+            return
+        await edit_or_send(q, order_text(o), KB(
+            ([[B("❌ Отменить ордер", callback_data=f"lo:c:{o['id']}")]] if o["status"] == "active" else [])
+            + [[B("⬅️ К ордерам", callback_data="lo:l")]]))
+        return
+    if act == "c":
+        ok = db.cancel_order(uid, int(parts[2]))
+        await q.answer("Ордер отменён" if ok else "Ордер уже не активен")
+        text, kb = orders_view(uid)
+        await edit_or_send(q, text, kb)
+        return
+
+    # --- редактор
+    if act == "new":
+        tid = int(parts[2])
+        if not db.token_by_id(tid):
+            await q.answer("Токен не найден", show_alert=True)
+            return
+        if not await need_wallet(update):
+            return
+        await q.answer()
+        ctx.user_data["lo_draft"] = new_draft(uid, tid)
+        await send_draft(uid, chat, ctx)
+        return
+    d = ctx.user_data.get("lo_draft")
+    if not d:
+        await q.answer("Черновик устарел — откройте токен и нажмите «Лимит-ордер» снова", show_alert=True)
+        return
+    if act == "r":
+        await q.answer("Обновлено")
+    elif act == "side":
+        d["side"] = "sell" if d["side"] == "buy" else "buy"
+        d["value"] = None  # направление цели меняется — цену задаём заново
+        await q.answer()
+    elif act == "mode":
+        d["mode"] = "stop" if d["mode"] == "basic" else "basic"
+        d["value"] = None
+        await q.answer()
+    elif act == "wal":
+        ws = [w[0] for w in db.wallets(uid)]
+        if ws:
+            d["wid"] = ws[(ws.index(d["wid"]) + 1) % len(ws)] if d["wid"] in ws else ws[0]
+        await q.answer()
+    elif act == "slip":
+        cur = d["slip"]
+        d["slip"] = next((s for s in SLIP_STEPS if s > cur), SLIP_STEPS[0])
+        await q.answer()
+    elif act == "pct":
+        d["pct"] = next((p for p in PCT_STEPS if p > d["pct"]), PCT_STEPS[0])
+        await q.answer()
+    elif act == "amt":
+        await q.answer()
+        ctx.user_data["await"] = ("lo_amt",)
+        await chat.send_message("Сколько NEAR потратить на покупку? Например: 1.5")
+        return
+    elif act == "name":
+        await q.answer()
+        ctx.user_data["await"] = ("lo_name",)
+        await chat.send_message("Название ордера (до 24 символов), например: «докупка на дне»")
+        return
+    elif act == "price":
+        await q.answer()
+        d.setdefault("pu", "pct")
+        ctx.user_data["await"] = ("lo_price",)
+        text, kb = price_prompt(d)
+        await chat.send_message(text, reply_markup=kb)
+        return
+    elif act == "pu":
+        d["pu"] = parts[2]
+        ctx.user_data["await"] = ("lo_price",)
+        await q.answer(UNIT_LABEL[parts[2]])
+        text, kb = price_prompt(d)
+        await q.edit_message_text(text, reply_markup=kb)
+        return
+    elif act == "pp":
+        d["unit"], d["value"] = "pct", float(parts[2])
+        ctx.user_data.pop("await", None)
+        await q.answer()
+    elif act == "pc":
+        ctx.user_data.pop("await", None)
+        await q.answer("Отменено")
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+    elif act == "x":
+        ctx.user_data.pop("lo_draft", None)
+        ctx.user_data.pop("await", None)
+        await q.answer("Отменено")
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+    elif act == "ok":
+        await create_order(q, ctx, uid, d)
+        return
+    await send_draft(uid, chat, ctx, edit_q=q)
+
+
+async def create_order(q, ctx, uid: int, d: dict):
+    if d["value"] is None:
+        await q.answer("Сначала задайте цену", show_alert=True)
+        return
+    if not d["wid"] or not db.wallet(uid, d["wid"]):
+        await q.answer("Выберите кошелёк", show_alert=True)
+        return
+    if len(db.user_orders(uid)) >= MAX_ORDERS:
+        await q.answer(f"Максимум {MAX_ORDERS} активных ордеров", show_alert=True)
+        return
+    token = _token_from_cb(str(d["tid"]))
+    try:
+        st = await token_state(token)
+    except (NoPool, RpcError) as e:
+        await q.answer(f"Не удалось получить цену: {str(e)[:80]}", show_alert=True)
+        return
+    unit, target = d["unit"], d["value"]
+    if unit == "pct":  # проценты фиксируем в цену NEAR в момент создания
+        unit, target = "near", target_to(st, "pct", d["value"], "near")
+    if target <= 0:
+        await q.answer("Цель получилась ≤ 0 — задайте другую цену", show_alert=True)
+        return
+    amount = to_yocto(d["amount"]) if d["side"] == "buy" else None
+    if amount and amount > MAX_BUY:
+        await q.answer(f"Больше лимита {fmt_near(MAX_BUY)} NEAR на одну покупку", show_alert=True)
+        return
+    oid = db.add_order(uid, d["wid"], token, d["side"], order_cond(d["side"], d["mode"]), unit, target, amount,
+                       d["pct"] if d["side"] == "sell" else None, d["slip"], d["name"][:24])
+    ctx.user_data.pop("lo_draft", None)
+    await q.answer("Ордер создан")
+    o = db.order(uid, oid)
+    await q.edit_message_text("✅ <b>Ордер создан.</b> Бот проверяет цену каждые "
+                              f"{ORDER_POLL} сек и пришлёт уведомление, когда он исполнится.\n\n" + order_text(o),
+                              parse_mode=ParseMode.HTML,
+                              reply_markup=KB([[B("📋 Мои ордера", callback_data="lo:l"),
+                                                B("❌ Отменить", callback_data=f"lo:c:{oid}")]]))
+
+
+STATUS_LABEL = {"active": "⏳ активен", "executing": "⚙️ исполняется", "done": "✅ исполнен",
+                "failed": "❌ не исполнен", "cancelled": "🚫 отменён"}
+
+
+def order_text(o: dict) -> str:
+    row = db.c.execute("SELECT symbol, decimals FROM tokens WHERE address=?", (o["token"],)).fetchone()
+    sym = row[0] if row and row[0] else o["token"]
+    side = "📈 Покупка" if o["side"] == "buy" else "📉 Продажа"
+    mode = "basic" if order_cond(o["side"], "basic") == o["cond"] else "stop"
+    sign = "≤" if o["cond"] == "le" else "≥"
+    what = (f"на {fmt_near(int(o['amount']))} Ⓝ" if o["side"] == "buy" else f"{o['pct']:g}% баланса")
+    lines = [f"<b>#{o['id']}</b> {side} · {mode_label(o['side'], mode)[2:]} · <b>${esc(sym)}</b>"
+             + (f" · 🏷 {esc(o['name'])}" if o["name"] else ""),
+             f"🎯 когда {'цена' if o['unit'] != 'mc' else 'MC'} {sign} {fmt_unit(o['unit'], o['target'])} · {what}",
+             f"🍌 slippage {o['slippage_bps'] / 100:g}% · {STATUS_LABEL.get(o['status'], o['status'])}"]
+    if o.get("note"):
+        lines.append(f"ℹ️ {esc(o['note'])}")
+    if o.get("tx"):
+        lines.append(f"🔗 {nb_tx(o['tx'])}")
+    return "\n".join(lines)
+
+
+def orders_view(uid: int) -> tuple[str, KB]:
+    act = db.user_orders(uid)
+    if not act:
+        recent = db.user_orders(uid, active_only=False, limit=5)
+        text = "📋 <b>Лимит-ордера</b>\n\nАктивных ордеров нет. Откройте токен (пришлите контракт) и нажмите «📋 Лимит-ордер»."
+        if recent:
+            text += "\n\n<b>Последние:</b>\n\n" + "\n\n".join(order_text(o) for o in recent)
+        return text, None
+    text = f"📋 <b>Активные лимит-ордера</b> ({len(act)}/{MAX_ORDERS})\n\n" + "\n\n".join(order_text(o) for o in act)
+    if len(text) > 3800:
+        text = text[:3800] + "…"
+    kb = [[B(f"#{o['id']} — открыть / отменить", callback_data=f"lo:o:{o['id']}")] for o in act[:12]]
+    return text, KB(kb)
+
+
+async def show_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, kb = orders_view(update.effective_user.id)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                              disable_web_page_preview=True)
+
+
+async def order_input(update: Update, ctx, kind: str, text: str):
+    uid = update.effective_user.id
+    d = ctx.user_data.get("lo_draft")
+    if not d:
+        await update.message.reply_text("Черновик ордера устарел — откройте токен и нажмите «Лимит-ордер» снова.")
+        return
+    if kind == "lo_amt":
+        v = parse_num(text)
+        if not v:
+            await update.message.reply_text("Неверное число.")
+        else:
+            d["amount"] = f"{v:g}"
+    elif kind == "lo_name":
+        d["name"] = " ".join(text.split())[:24]
+    elif kind == "lo_price":
+        unit = d.get("pu", "pct")
+        v = parse_value(text, unit)
+        if v is None:
+            ctx.user_data["await"] = ("lo_price",)
+            await update.message.reply_text("Не понял число, попробуйте ещё раз (или 🚫 Отмена).")
+            return
+        if unit == "pct":
+            up = (d["side"] == "sell") == (d["mode"] == "basic")
+            v = abs(v) if up else -abs(v)
+            if v <= -100:
+                await update.message.reply_text("Падение не может быть 100% и больше.")
+                return
+        d["unit"], d["value"] = unit, v
+    await send_draft(uid, update.effective_chat, ctx)
+
+
+# ---------------------------------------------------------------- исполнение ордеров
+async def check_orders(ctx: ContextTypes.DEFAULT_TYPE):
+    orders = db.active_orders()
+    if not orders:
+        return
+    states: dict[str, dict | None] = {}
+    for token in {o["token"] for o in orders}:
+        try:
+            states[token] = await token_state(token)
+        except Exception as e:  # пул пропал / сеть занята — проверим на следующем круге
+            log.info("orders: price %s: %s", token, str(e)[:120])
+            states[token] = None
+    for o in orders:
+        st = states.get(o["token"])
+        if not st or not st["near"]:
+            continue
+        cur = in_unit(st, o["unit"])
+        hit = cur <= o["target"] if o["cond"] == "le" else cur >= o["target"]
+        if hit and db.claim_order(o["id"]):
+            asyncio.create_task(execute_order(ctx.bot, o, st))
+
+
+async def execute_order(tg_bot, o: dict, st: dict):
+    uid, token = o["user_id"], o["token"]
+    sym, dec = st["sym"], st["dec"]
+    tid = db.token_id(token, sym, dec)
+    open_kb = KB([[B(f"📊 ${sym}", callback_data=f"c:{tid}"), B("📋 Ордера", callback_data="lo:l")]])
+
+    async def tell(text):
+        try:
+            await tg_bot.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=open_kb,
+                                      disable_web_page_preview=True)
+        except Exception as e:
+            log.info("order notify %s: %s", uid, e)
+
+    s = signer_for(uid, o["wallet_id"])
+    if not s:
+        db.finish_order(o["id"], "failed", note="кошелёк удалён")
+        await tell(f"❌ Ордер #{o['id']} (${esc(sym)}) не исполнен: кошелёк удалён из бота.")
+        return
+    key = (s.account_id, token)
+    while key in BUSY:
+        await asyncio.sleep(1)
+    BUSY.add(key)
+    try:
+        if o["side"] == "buy":
+            amount = int(o["amount"])
+            bal = await ref.native_balance(s.account_id)
+            if amount > bal - GAS_RESERVE:
+                db.finish_order(o["id"], "failed", note=f"не хватило NEAR: баланс {fmt_near(bal)}")
+                await tell(f"❌ Ордер #{o['id']} сработал, но на кошельке {fmt_near(bal)} Ⓝ — "
+                           f"не хватает на покупку {fmt_near(amount)} Ⓝ + газ. Ордер закрыт.")
+                return
+            r = await ref.buy(s, token, amount, o["slippage_bps"])
+            db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
+            db.finish_order(o["id"], "done", tx=r["hash"])
+            await tell(f"✅ <b>Лимит-ордер #{o['id']} исполнен</b>\nКуплено <b>{fmt_tok(r['got'], dec)} ${esc(sym)}</b> "
+                       f"за {fmt_near(amount)} Ⓝ по цене ≈{near_px(st['near'])} Ⓝ · MC {k_usd(st['mc'])} · {nb_tx(r['hash'])}")
+        else:
+            bal = await ref.ft_balance(token, s.account_id)
+            amount = bal if o["pct"] >= 100 else int(Decimal(bal) * Decimal(str(o["pct"])) / 100)
+            if amount <= 0:
+                db.finish_order(o["id"], "failed", note="нечего продавать")
+                await tell(f"❌ Ордер #{o['id']} сработал, но ${esc(sym)} на кошельке нет. Ордер закрыт.")
+                return
+            r = await ref.sell(s, token, amount, o["slippage_bps"])
+            db.add_trade(s.account_id, token, "sell", amount, r["got"], r["hash"])
+            db.finish_order(o["id"], "done", tx=r["hash"])
+            what = "Стоп-лосс" if o["cond"] == "le" else "Тейк-профит"
+            await tell(f"✅ <b>{what} #{o['id']} исполнен</b>\nПродано {fmt_tok(amount, dec)} ${esc(sym)} → "
+                       f"<b>{fmt_near(r['got'])} Ⓝ</b> · MC {k_usd(st['mc'])} · {nb_tx(r['hash'])}")
+    except (TxFailed, RpcError, NoPool) as e:
+        h = e.tx_hash if isinstance(e, TxFailed) else None
+        db.finish_order(o["id"], "failed", tx=h, note=str(e)[:200])
+        await tell(f"❌ Ордер #{o['id']} (${esc(sym)}) не исполнен: {esc(str(e)[:250])}"
+                   + (f" · {nb_tx(h)}" if h else ""))
+    except Exception as e:
+        log.exception("order %s", o["id"])
+        db.finish_order(o["id"], "failed", note=f"внутренняя ошибка: {type(e).__name__}")
+        await tell(f"❌ Ордер #{o['id']} (${esc(sym)}) не исполнен из-за внутренней ошибки. Проверьте баланс.")
+    finally:
+        BUSY.discard(key)
+
+
 # ---------------------------------------------------------------- позиции
 async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = await need_wallet(update)
@@ -910,7 +1394,7 @@ def parse_num(s: str) -> Decimal | None:
 
 
 MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings,
-                "↗️ Вывод": cmd_withdraw}
+                "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -934,6 +1418,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             detail = await wallet_detail(uid, pending[1])
             if detail:
                 await update.message.reply_text(detail[0], parse_mode=ParseMode.HTML, reply_markup=detail[1])
+        elif kind in ("lo_amt", "lo_name", "lo_price"):
+            await order_input(update, ctx, kind, text)
         elif kind == "tr_token":
             await transfer_token_addr(update, ctx, pending[1], text)
         elif kind == "tr_to":
@@ -985,7 +1471,8 @@ async def post_init(app: Application):
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
     await app.bot.set_my_commands([("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"),
-                                   ("withdraw", "Вывод средств"), ("settings", "Настройки")])
+                                   ("orders", "Лимит-ордера"), ("withdraw", "Вывод средств"), ("settings", "Настройки")])
+    db.reset_stuck_orders()
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1006,6 +1493,8 @@ def main():
     app.add_handler(CommandHandler("positions", show_positions))
     app.add_handler(CommandHandler("settings", show_settings))
     app.add_handler(CommandHandler("withdraw", cmd_withdraw))
+    app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(CallbackQueryHandler(on_order_cb, pattern=r"^lo:"))
     app.add_handler(CallbackQueryHandler(on_cancel_cb, pattern=r"^w:x:"))
     app.add_handler(CallbackQueryHandler(on_wallet_cb, pattern=r"^w:"))
     app.add_handler(CallbackQueryHandler(on_transfer_cb, pattern=r"^tr:"))
@@ -1014,6 +1503,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
+    app.job_queue.run_repeating(check_orders, interval=ORDER_POLL, first=20)
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 

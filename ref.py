@@ -42,6 +42,7 @@ class Ref:
     def __init__(self, rpc: Rpc):
         self.rpc = rpc
         self._meta: dict[str, dict] = {}
+        self._supply: dict[str, tuple[float, int]] = {}
         self._routes: dict[str, tuple[float, Route]] = {}
         self.pools_by_token: dict[str, list[int]] = {}
         self.indexed = 0
@@ -171,6 +172,27 @@ class Ref:
             raise TxFailed(f"токен просит необычно большой storage-депозит ({dep / YOCTO} NEAR), отменено")
         await s.send(token, [FunctionCall("storage_deposit", {"account_id": s.account_id, "registration_only": True},
                                           gas=30 * TGAS, deposit=dep)])
+
+    async def total_supply(self, token: str) -> int:
+        hit = self._supply.get(token)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+        v = int(await self.rpc.view(token, "ft_total_supply") or 0)
+        self._supply[token] = (time.time(), v)
+        return v
+
+    async def spot_price(self, r: "Route", token: str, dec: int) -> float:
+        """Текущая цена 1 токена в NEAR прямо из пула (без комиссии и проскальзывания)."""
+        if r.kind == "ref":
+            p = await self.rpc.view(REF, "get_pool", {"pool_id": r.pool_id})
+            toks, amts = p["token_account_ids"], [int(a) for a in p["amounts"]]
+            wn, tr = amts[toks.index(WNEAR)], amts[toks.index(token)]
+            return (wn / YOCTO) / (tr / 10 ** dec) if tr else 0.0
+        p = await self.rpc.view(DCL, "get_pool", {"pool_id": r.pool_id})
+        raw = 1.0001 ** int(p["current_point"])  # amount_y / amount_x в «сырых» единицах
+        if p.get("token_x") == token:
+            return raw * 10 ** dec / YOCTO
+        return (1 / raw) * 10 ** dec / YOCTO if raw else 0.0
 
     async def ft_metadata(self, token: str) -> dict:
         if token not in self._meta:
