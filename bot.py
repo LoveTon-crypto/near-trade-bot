@@ -972,6 +972,7 @@ async def do_sell(uid: int, s: Signer, chat, token: str, pct: Decimal):
         db.add_trade(s.account_id, token, "sell", amount, r["got"], r["hash"])
         await msg.edit_text(f"✅ Продано {pct:g}% → <b>{fmt_near(r['got'])} NEAR</b> · {nb_tx(r['hash'])}",
                             parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await post_pnl(uid, s, token)
         await send_card(uid, chat, token)
     except NoPool:
         await msg.edit_text("❌ Нет пула с NEAR ни на Ref, ни на Ref DCL для этого токена.")
@@ -1530,6 +1531,7 @@ async def execute_order(tg_bot, o: dict, st: dict):
             what = "Стоп-лосс" if o["cond"] == "le" else "Тейк-профит"
             await tell(f"✅ <b>{what} #{o['id']} исполнен</b>\nПродано {fmt_tok(amount, dec)} ${esc(sym)} → "
                        f"<b>{fmt_near(r['got'])} Ⓝ</b> · MC {k_usd(st['mc'])} · {nb_tx(r['hash'])}")
+            await post_pnl(uid, s, token)
     except (TxFailed, RpcError, NoPool) as e:
         h = e.tx_hash if isinstance(e, TxFailed) else None
         db.finish_order(o["id"], "failed", tx=h, note=str(e)[:200])
@@ -1700,46 +1702,71 @@ def share_url(link: str, text: str) -> str:
     return f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(text, safe='')}"
 
 
+async def build_pnl(bot_username: str, uid: int, s: Signer, token: str, hide: bool = False):
+    """PnL-карточка по позиции (открытой или только что закрытой) → (png, caption, kb) или None."""
+    pos = db.position(s.account_id, token)
+    if not pos["spent"]:
+        return None
+    tid = db.token_id(token)
+    _, sym, dec = db.token_by_id(tid)
+    bal = await ref.ft_balance(token, s.account_id)
+    val = await ref.quote_route(await ref.route(token), token, bal, WNEAR) if bal and pos["open"] else 0
+    spent, got = pos["spent"], pos["got"]
+    worth = got + val
+    pct = (worth / spent - 1) * 100
+    closed = not pos["open"] or not bal
+    hold = hold_fmt(time.time() - pos["since"]) if pos["since"] else ""
+    link = buy_link(bot_username, uid, tid)
+    png = await asyncio.to_thread(pnl_card.render, sym or "?", pct, spent / YOCTO, worth / YOCTO, hold,
+                                  db.ref_code(uid), "NDBOT", hide, None, user_pics(uid),
+                                  db.get(f"u{uid}:pics_only", False), ("BOUGHT", "SOLD") if closed else ("INVESTED", "WORTH"))
+    caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
+               f"└ 🔗 {esc(link)}")
+    share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if lang_of(uid) == "en"
+                  else f"${sym} {pct:+.1f}% в NDbot 🚀 Купить в один клик:")
+    wid = wallet_id_of(uid, s.account_id) or 0
+    kb = KB([[B("📤 Поделиться PnL", url=share_url(link, share_text))],
+             [B("👁 Показать суммы", callback_data=f"pn:{tid}:s:{wid}") if hide
+              else B("🙈 Скрыть суммы", callback_data=f"pn:{tid}:h:{wid}")],
+             [B("🙈 Скрыть", callback_data="w:x:0")]])
+    return png, caption, kb
+
+
+async def post_pnl(uid: int, s: Signer, token: str):
+    """После продажи — сразу PnL-карточка (как в DTrade). Ошибки здесь не должны мешать самой продаже."""
+    try:
+        res = await build_pnl(APP_BOT.username, uid, s, token)
+        if res:
+            png, caption, kb = res
+            await APP_BOT.send_photo(uid, png, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        log.info("pnl after sell %s: %s", token, e)
+
+
 async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """pn:<tid> — новая карточка; pn:<tid>:h / pn:<tid>:s — перерисовать со скрытыми / открытыми суммами."""
+    """pn:<tid> — новая карточка; pn:<tid>:h|s:<wid> — перерисовать со скрытыми / открытыми суммами."""
     q = update.callback_query
     uid = q.from_user.id
     parts = q.data.split(":")
     token = _token_from_cb(parts[1])
     hide = len(parts) > 2 and parts[2] == "h"
-    s = active_signer(uid)
+    wid = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() and int(parts[3]) else None
+    s = signer_for(uid, wid) if wid else active_signer(uid)
     if not token or not s:
         await q.answer("Токен не найден", show_alert=True)
         return
-    pos = db.position(s.account_id, token)
-    if not pos["open"] or not pos["spent"]:
+    if not db.position(s.account_id, token)["spent"]:
         await q.answer("Нет открытой позиции по этому токену", show_alert=True)
         return
     await q.answer("🎨 Рисую карточку…")
-    tid = db.token_id(token)
-    _, sym, dec = db.token_by_id(tid)
     try:
-        bal = await ref.ft_balance(token, s.account_id)
-        val = await ref.quote_route(await ref.route(token), token, bal, WNEAR) if bal else 0
+        res = await build_pnl(ctx.bot.username, uid, s, token, hide)
     except (NoPool, RpcError):
         await q.message.chat.send_message("⏳ Не удалось получить цену, попробуйте через пару секунд.")
         return
-    spent, got = pos["spent"], pos["got"]
-    worth = got + val
-    pct = (worth / spent - 1) * 100
-    hold = hold_fmt(time.time() - pos["since"]) if pos["since"] else ""
-    code = db.ref_code(uid)
-    link = buy_link(ctx.bot.username, uid, tid)
-    png = await asyncio.to_thread(pnl_card.render, sym or "?", pct, spent / YOCTO, worth / YOCTO, hold, code,
-                                  "NDBOT", hide, None, user_pics(uid), db.get(f"u{uid}:pics_only", False))
-    caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
-               f"└ 🔗 {esc(link)}")
-    share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if lang_of(uid) == "en"
-                  else f"${sym} {pct:+.1f}% в NDbot 🚀 Купить в один клик:")
-    kb = KB([[B("📤 Поделиться PnL", url=share_url(link, share_text))],
-             [B("👁 Показать суммы", callback_data=f"pn:{tid}:s") if hide
-              else B("🙈 Скрыть суммы", callback_data=f"pn:{tid}:h")],
-             [B("🙈 Скрыть", callback_data="w:x:0")]])
+    if not res:
+        return
+    png, caption, kb = res
     if len(parts) > 2 and q.message.photo:
         await q.message.edit_media(InputMediaPhoto(png, caption=caption, parse_mode=ParseMode.HTML), reply_markup=kb)
     else:
@@ -1961,6 +1988,7 @@ async def run_copy(t: dict, side: str, token: str, leader_near: int, frac: float
             await tell(head + f"Лидер продал {min(frac, 1) * 100:.0f}% <b>${esc(sym)}</b>\n"
                               f"✅ Продано {fmt_tok(amount, dec)} ${esc(sym)} → <b>{fmt_near(r['got'])} Ⓝ</b> · "
                               f"{nb_tx(r['hash'])}", tid)
+            await post_pnl(uid, s, token)
     except (TxFailed, RpcError, NoPool) as e:
         db.copy_done(t["id"], tx, "fail", str(e)[:200])
         act = "покупку" if side == "buy" else "продажу"
@@ -2308,6 +2336,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global HUB, APP_BOT
     APP_BOT = app.bot
+    await app.bot.get_me()  # username для ссылок в карточках из фоновых задач
     HUB = copytrade.Hub(on_leader_trade)
     await copy_sync()
     try:

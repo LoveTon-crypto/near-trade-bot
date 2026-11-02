@@ -176,7 +176,8 @@ def fmt_amount(v: float) -> str:
 
 def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref_code: str,
            brand: str = "NDBOT", hide: bool = False, seed: int | None = None,
-           user_pics: dict | None = None, only_user: bool = False) -> bytes:
+           user_pics: dict | None = None, only_user: bool = False,
+           labels: tuple[str, str] = ("INVESTED", "WORTH")) -> bytes:
     rng = random.Random(seed)
     win = pct >= 0
     t = THEME[win]
@@ -208,7 +209,7 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
     d.text((x0, 342), pnl_s, font=f, fill=(15, 20, 35))
     coin(d, int(x0 + w - 24), 374, 24)
 
-    rows = [("INVESTED", "****" if hide else fmt_amount(initial)), ("WORTH", "****" if hide else fmt_amount(worth))]
+    rows = [(labels[0], "****" if hide else fmt_amount(initial)), (labels[1], "****" if hide else fmt_amount(worth))]
     y = 448
     for label, val in rows:
         d.text((left, y), label, font=font(40), fill=(255, 255, 255))
