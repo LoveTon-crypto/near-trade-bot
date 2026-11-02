@@ -101,7 +101,7 @@ EN: dict[str, str] = {
     "✅ Отправлено ": "✅ Sent ", " на <code>": " to <code>", "❌ Ошибка: ": "❌ Error: ",
 
     # token card / trading
-    "💲 Цена: <b>": "💲 Price: <b>", "🔀 Пул: ": "🔀 Pool: ", "📊 Объём 24ч: ": "📊 Volume 24h: ", " · сделок ": " · trades ",
+    "% за 24ч": "% 24h", "💲 Цена: <b>": "💲 Price: <b>", "🔀 Пул: ": "🔀 Pool: ", "📊 Объём 24ч: ": "📊 Volume 24h: ", " · сделок ": " · trades ",
     "⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.":
         "⚠️ No NEAR pool on Ref or Ref DCL. JustHoot tokens before migration aren't supported yet.",
     "👛 У вас: <b>": "👛 You hold: <b>", "📥 Вложено: <b>": "📥 Invested: <b>", "💰 Текущая стоимость: <b>": "💰 Current value: <b>",

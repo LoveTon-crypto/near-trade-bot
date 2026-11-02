@@ -729,7 +729,7 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     ch = (c.chg.get("h24") if c else None)
     head = f"<b>${esc(sym)}</b> · {esc(str(name)[:32])}"
     if ch is not None:
-        head += f" | {'🟢' if ch >= 0 else '🔴'} {ch:+.2f}%"
+        head += f" | {'🟢' if ch >= 0 else '🔴'} {ch:+.2f}% за 24ч"
     lines = [head, f"<code>{esc(token)}</code>"]
     pad = "nearly" if token.endswith(".nearlytrade.near") else ("justhoot" if "justhoot" in token else "")
     links = [f'<a href="https://dexscreener.com/near/{esc(token)}">DS</a>',
