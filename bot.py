@@ -232,7 +232,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     arg = ctx.args[0] if ctx.args else ""
     open_tid = None
-    if "_t" in arg:
+    open_token = None
+    # ?start=r<код>_c<адрес токена, точки → «=»> или c<адрес> — быстрая покупка из других ботов (аналайзер, канал деплоев)
+    if arg.startswith("c") or "_c" in arg:
+        arg, _, c = arg.partition("_c") if "_c" in arg else ("", "", arg[1:])
+        cand = c.replace("=", ".").lower()
+        if ADDR_RE.fullmatch(cand):
+            open_token = cand
+    elif "_t" in arg:
         arg, _, t = arg.partition("_t")
         open_tid = int(t) if t.isdigit() else None
     if arg.startswith("r") and db.is_fresh(uid):
@@ -244,7 +251,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     if open_tid and db.token_by_id(open_tid):
-        token = db.token_by_id(open_tid)[0]
+        open_token = db.token_by_id(open_tid)[0]
+    if open_token:
+        token = open_token
         if not active_signer(uid):
             await update.message.reply_text("Чтобы купить токен, создайте кошелёк — это займёт секунду:", reply_markup=MENU)
             await update.message.reply_text("👛 Кошелёк:", reply_markup=KB([[B("➕ Создать", callback_data="w:new"),
