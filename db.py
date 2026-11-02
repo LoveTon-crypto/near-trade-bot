@@ -46,6 +46,14 @@ class DB:
         CREATE TABLE IF NOT EXISTS copy_log (id INTEGER PRIMARY KEY AUTOINCREMENT, target_id INTEGER, tx TEXT,
             ts INTEGER, side TEXT, token TEXT, status TEXT, note TEXT, UNIQUE(target_id, tx));
         CREATE INDEX IF NOT EXISTS ref_earn_user ON ref_earn(user_id);
+        CREATE TABLE IF NOT EXISTS snipe_targets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            wallet_id INTEGER, dev TEXT NOT NULL, name TEXT, amount REAL NOT NULL DEFAULT 0.5,
+            slippage_bps INTEGER NOT NULL DEFAULT 2000, tp_pct REAL NOT NULL DEFAULT 100,
+            tp_sell REAL NOT NULL DEFAULT 50, sl_pct REAL NOT NULL DEFAULT 50, jh_wait INTEGER NOT NULL DEFAULT 1,
+            repeat INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1, created INTEGER,
+            UNIQUE(user_id, dev));
+        CREATE TABLE IF NOT EXISTS snipe_log (id INTEGER PRIMARY KEY AUTOINCREMENT, target_id INTEGER, token TEXT,
+            ts INTEGER, status TEXT, tx TEXT, note TEXT, UNIQUE(target_id, token));
         """)
         ucols = {r[1] for r in self.c.execute("PRAGMA table_info(users)")}
         if "ref_code" not in ucols:
@@ -208,6 +216,14 @@ class DB:
                              (int(time.time()), oid, uid))
         self.c.commit()
         return cur.rowcount == 1
+
+    def cancel_sells(self, uid, wid, token) -> int:
+        """Позиция закрыта полностью — остальные ордера на продажу этого токена с этого кошелька уже не нужны."""
+        cur = self.c.execute("UPDATE orders SET status='cancelled', done_ts=?, note='позиция закрыта' WHERE user_id=? "
+                             "AND wallet_id=? AND token=? AND side='sell' AND status='active'",
+                             (int(time.time()), uid, wid, token))
+        self.c.commit()
+        return cur.rowcount
 
     def cancel_all_orders(self, uid) -> int:
         cur = self.c.execute("UPDATE orders SET status='cancelled', done_ts=? WHERE user_id=? AND status='active'",
@@ -417,3 +433,63 @@ class DB:
         r = self.c.execute("SELECT SUM(status='done'), SUM(status!='done' AND status!='run') FROM copy_log "
                            "WHERE target_id=?", (cid,)).fetchone()
         return int(r[0] or 0), int(r[1] or 0)
+
+    # ------------------------------------------------------------ снайпер деплоера
+    _ST = "id, user_id, wallet_id, dev, name, amount, slippage_bps, tp_pct, tp_sell, sl_pct, jh_wait, repeat, active"
+
+    def _st(self, r):
+        return dict(zip([c.strip() for c in self._ST.split(",")], r)) if r else None
+
+    def add_snipe(self, uid, wid, dev, slippage_bps) -> int:
+        cur = self.c.execute("INSERT INTO snipe_targets (user_id, wallet_id, dev, name, slippage_bps, created) "
+                             "VALUES (?,?,?,?,?,?)", (uid, wid, dev, "", slippage_bps, int(time.time())))
+        self.c.commit()
+        return cur.lastrowid
+
+    def snipe_target(self, uid, sid):
+        return self._st(self.c.execute(f"SELECT {self._ST} FROM snipe_targets WHERE id=? AND user_id=?",
+                                       (sid, uid)).fetchone())
+
+    def user_snipes(self, uid):
+        return [self._st(r) for r in self.c.execute(f"SELECT {self._ST} FROM snipe_targets WHERE user_id=? ORDER BY id",
+                                                    (uid,))]
+
+    def snipes_of(self, dev):
+        return [self._st(r) for r in self.c.execute(
+            f"SELECT {self._ST} FROM snipe_targets WHERE dev=? AND active=1", (dev,))]
+
+    def update_snipe(self, uid, sid, **kw):
+        allowed = {"wallet_id", "name", "amount", "slippage_bps", "tp_pct", "tp_sell", "sl_pct", "jh_wait", "repeat",
+                   "active"}
+        for k, v in kw.items():
+            if k in allowed:
+                self.c.execute(f"UPDATE snipe_targets SET {k}=? WHERE id=? AND user_id=?", (v, sid, uid))
+        self.c.commit()
+
+    def delete_snipe(self, uid, sid):
+        self.c.execute("DELETE FROM snipe_targets WHERE id=? AND user_id=?", (sid, uid))
+        self.c.commit()
+
+    def claim_snipe(self, sid, token) -> bool:
+        """Один токен снайпится целью один раз."""
+        try:
+            self.c.execute("INSERT INTO snipe_log (target_id, token, ts, status) VALUES (?,?,?,'run')",
+                           (sid, token, int(time.time())))
+            self.c.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def snipe_done(self, sid, token, status, tx=None, note=None):
+        self.c.execute("UPDATE snipe_log SET status=?, tx=?, note=? WHERE target_id=? AND token=?",
+                       (status, tx, note, sid, token))
+        self.c.commit()
+
+    def snipe_stats(self, sid) -> tuple[int, int]:
+        r = self.c.execute("SELECT SUM(status='done'), SUM(status!='done' AND status!='run') FROM snipe_log "
+                           "WHERE target_id=?", (sid,)).fetchone()
+        return int(r[0] or 0), int(r[1] or 0)
+
+    def snipe_history(self, sid, limit=5):
+        return self.c.execute("SELECT token, ts, status, note FROM snipe_log WHERE target_id=? ORDER BY id DESC LIMIT ?",
+                              (sid, limit)).fetchall()

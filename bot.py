@@ -31,6 +31,7 @@ from db import DB
 import market
 import i18n
 import copytrade
+import snipe
 import pnl_card
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
@@ -138,8 +139,8 @@ class I18nBot(ExtBot):
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
-MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "🔁 Копитрейд"], ["↗️ Вывод", "🤝 Рефералы"],
-                            ["⚙️ Настройки"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["💼 Кошелёк", "📊 Позиции"], ["📋 Ордера", "🔁 Копитрейд"], ["🎯 Снайпер", "↗️ Вывод"],
+                            ["🤝 Рефералы", "⚙️ Настройки"]], resize_keyboard=True)
 _price = {"usd": 0.0, "ts": 0.0}
 
 
@@ -1532,6 +1533,10 @@ async def execute_order(tg_bot, o: dict, st: dict):
             what = "Стоп-лосс" if o["cond"] == "le" else "Тейк-профит"
             await tell(f"✅ <b>{what} #{o['id']} исполнен</b>\nПродано {fmt_tok(amount, dec)} ${esc(sym)} → "
                        f"<b>{fmt_near(r['got'])} Ⓝ</b> · MC {k_usd(st['mc'])} · {nb_tx(r['hash'])}")
+            if amount >= bal:
+                n = db.cancel_sells(uid, o["wallet_id"], token)
+                if n:
+                    await tell(f"🚫 Позиция ${esc(sym)} закрыта — остальные ордера на продажу ({n}) отменены.")
             await post_pnl(uid, s, token)
     except (TxFailed, RpcError, NoPool) as e:
         h = e.tx_hash if isinstance(e, TxFailed) else None
@@ -2212,6 +2217,306 @@ async def copy_input(update: Update, ctx, pending, text: str):
     await update.message.reply_text(text_, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
 
+# ---------------------------------------------------------------- снайпер деплоера
+# Пользователь добавляет кошельки девов. Как только такой кошелёк деплоит токен на nearly.trade или JustHoot,
+# бот покупает на заданную сумму и сразу ставит тейк-профит и стоп-лосс (обычные лимит-ордера).
+MAX_SNIPES = int(os.getenv("MAX_SNIPE_TARGETS", "10"))
+SNIPE_SLIPS = (1000, 2000, 3000, 5000)
+TP_SELLS = (25, 50, 75, 100)
+JH_WAIT_SEC = int(os.getenv("SNIPE_JUSTHOOT_WAIT_SEC", "120"))  # анти-снайп налог JustHoot после запуска
+POOL_WAIT_SEC = int(os.getenv("SNIPE_POOL_WAIT_SEC", "45"))     # сколько ждать появления пула после деплоя
+SNIPER: snipe.DeployWatcher | None = None
+PAD_NAME = {"nearly": "nearly.trade", "justhoot": "JustHoot"}
+
+
+async def on_deploy(token: str, fac: str, dev: str, tx: str):
+    for t in db.snipes_of(dev):
+        if db.claim_snipe(t["id"], token):
+            asyncio.create_task(run_snipe(t, token, snipe.FACTORIES.get(fac, fac), tx))
+
+
+async def wait_pool(token: str, deadline: float):
+    delay = 0.8
+    while True:
+        try:
+            return await ref.route(token, fresh=True)
+        except NoPool:
+            if time.time() > deadline:
+                raise
+        except RpcError as e:
+            if time.time() > deadline:
+                raise
+            log.info("snipe pool %s: %s", token, str(e)[:100])
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.4, 3)
+
+
+async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str):
+    uid, sid = t["user_id"], t["id"]
+    who = esc(t["name"] or short(t["dev"]))
+    head = f"🎯 <b>Снайпер</b> · {who} · {PAD_NAME.get(pad, pad)}\n"
+
+    async def tell(text, tid=None):
+        rows = [[B("📊 Токен", callback_data=f"c:{tid}"), B("📋 Ордера", callback_data="lo:l")]] if tid else []
+        rows.append([B("🎯 Снайпер", callback_data=f"sn:v:{sid}")])
+        try:
+            await APP_BOT.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=KB(rows),
+                                       disable_web_page_preview=True)
+        except Exception as e:
+            log.info("snipe notify %s: %s", uid, e)
+
+    s = signer_for(uid, t["wallet_id"]) if t["wallet_id"] else active_signer(uid)
+    if not s:
+        db.snipe_done(sid, token, "skip", note="нет кошелька")
+        return
+    amount = min(to_yocto(t["amount"]), MAX_BUY)
+    dep = f'<a href="https://nearblocks.io/txns/{esc(deploy_tx)}">деплой</a>' if deploy_tx else "деплой"
+    try:
+        bal = await ref.native_balance(s.account_id)
+        if amount > bal - GAS_RESERVE:
+            db.snipe_done(sid, token, "fail", note="мало NEAR")
+            await tell(head + f"Дев задеплоил <code>{esc(token)}</code> ({dep}), но на кошельке {fmt_near(bal)} Ⓝ — "
+                              f"не хватает на {fmt_near(amount)} Ⓝ + газ.")
+            return
+        if pad == "justhoot" and t["jh_wait"] and JH_WAIT_SEC > 0:
+            await tell(head + f"Дев задеплоил <code>{esc(token)}</code> ({dep}).\n"
+                              f"⏳ Жду {JH_WAIT_SEC} сек — окончание анти-снайп налога JustHoot, потом куплю.")
+            await asyncio.sleep(JH_WAIT_SEC)
+        await wait_pool(token, time.time() + POOL_WAIT_SEC)
+        key = (s.account_id, token)
+        while key in BUSY:
+            await asyncio.sleep(0.3)
+        BUSY.add(key)
+        try:
+            r = await swap_buy(uid, s, token, amount, t["slippage_bps"])
+        finally:
+            BUSY.discard(key)
+        db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
+        db.snipe_done(sid, token, "done", tx=r["hash"])
+        if not t["repeat"]:
+            db.update_snipe(uid, sid, active=0)
+        try:
+            meta = await ref.ft_metadata(token)
+        except RpcError:
+            meta = {}
+        sym, dec = str(meta.get("symbol") or token)[:20], int(meta.get("decimals") or 0)
+        tid = db.token_id(token, sym, dec)
+        entry = (amount / YOCTO) / (r["got"] / 10 ** dec) if r["got"] else 0
+        lines = [head + f"✅ Куплено <b>{fmt_tok(r['got'], dec)} ${esc(sym)}</b> за {fmt_near(amount)} Ⓝ · "
+                        f"{nb_tx(r['hash'])}"]
+        wid = wallet_id_of(uid, s.account_id)
+        if entry > 0 and wid:
+            if t["tp_pct"] > 0:
+                oid = db.add_order(uid, wid, token, "sell", "ge", "near", entry * (1 + t["tp_pct"] / 100), None,
+                                   t["tp_sell"], t["slippage_bps"], f"Снайп TP +{t['tp_pct']:g}%")
+                lines.append(f"📈 Тейк-профит #{oid}: +{t['tp_pct']:g}% → продать {t['tp_sell']:g}%")
+            if 0 < t["sl_pct"] < 100:
+                oid = db.add_order(uid, wid, token, "sell", "le", "near", entry * (1 - t["sl_pct"] / 100), None,
+                                   100, t["slippage_bps"], f"Снайп SL −{t['sl_pct']:g}%")
+                lines.append(f"🛑 Стоп-лосс #{oid}: −{t['sl_pct']:g}% → продать всё")
+        if not t["repeat"]:
+            lines.append("⏸ Снайпер этого дева поставлен на паузу (режим «только следующий деплой»).")
+        await tell("\n".join(lines), tid)
+    except NoPool:
+        db.snipe_done(sid, token, "fail", note="пул не появился")
+        await tell(head + f"❌ Дев задеплоил <code>{esc(token)}</code> ({dep}), но пул для покупки за NEAR "
+                          f"не появился за {POOL_WAIT_SEC} сек.")
+    except (TxFailed, RpcError) as e:
+        h = e.tx_hash if isinstance(e, TxFailed) else None
+        db.snipe_done(sid, token, "fail", tx=h, note=str(e)[:200])
+        await tell(head + f"❌ Не удалось купить <code>{esc(token)}</code>: {esc(str(e)[:200])}"
+                   + (f" · {nb_tx(h)}" if h else ""))
+    except Exception as e:
+        log.exception("snipe %s %s", sid, token)
+        db.snipe_done(sid, token, "fail", note=type(e).__name__)
+
+
+def snipe_summary(t: dict) -> str:
+    tp = f"TP +{t['tp_pct']:g}% ({t['tp_sell']:g}%)" if t["tp_pct"] > 0 else "TP выкл"
+    sl = f"SL −{t['sl_pct']:g}%" if 0 < t["sl_pct"] < 100 else "SL выкл"
+    return (f"{'🟢' if t['active'] else '⏸'} <b>{esc(t['name'] or short(t['dev']))}</b> · "
+            f"<code>{esc(short(t['dev']))}</code>\n"
+            f"   {t['amount']:g} Ⓝ · {tp} · {sl}")
+
+
+def snipes_view(uid: int) -> tuple[str, KB]:
+    ts = db.user_snipes(uid)
+    lines = ["🎯 <b>Снайпер деплоера</b>",
+             "Добавьте кошельки девов. Как только такой кошелёк задеплоит токен на nearly.trade или JustHoot, "
+             "бот сразу купит на заданную сумму и поставит тейк-профит и стоп-лосс."]
+    if SNIPER and SNIPER.state != "connected":
+        lines += ["", "⚠️ Поток новых токенов переподключается — снайпы могут задержаться."]
+    if ts:
+        lines += [""] + [snipe_summary(t) for t in ts]
+    else:
+        lines += ["", "Пока нет девов. Нажмите «➕ Добавить дева»."]
+    kb = [[B(f"⚙️ {t['name'] or short(t['dev'])}", callback_data=f"sn:v:{t['id']}")] for t in ts]
+    kb.append([B("➕ Добавить дева", callback_data="sn:add")])
+    return "\n".join(lines), KB(kb)
+
+
+def snipe_view(uid: int, t: dict) -> tuple[str, KB]:
+    done, failed = db.snipe_stats(t["id"])
+    w = db.wallet(uid, t["wallet_id"]) if t["wallet_id"] else None
+    lines = [f"🎯 <b>{esc(t['name'] or short(t['dev']))}</b>", f"<code>{esc(t['dev'])}</code>",
+             f'<a href="https://nearblocks.io/address/{esc(t["dev"])}">Nearblocks</a>', "",
+             f"Статус: {'🟢 активен' if t['active'] else '⏸ на паузе'}",
+             f"Покупка: <b>{t['amount']:g} Ⓝ</b> · slippage {t['slippage_bps'] / 100:g}%",
+             "Тейк-профит: " + (f"<b>+{t['tp_pct']:g}%</b> → продать {t['tp_sell']:g}%" if t["tp_pct"] > 0 else "выкл"),
+             "Стоп-лосс: " + (f"<b>−{t['sl_pct']:g}%</b> → продать всё" if 0 < t["sl_pct"] < 100 else "выкл"),
+             "JustHoot: " + (f"ждать {JH_WAIT_SEC} сек (анти-снайп налог)" if t["jh_wait"] else "покупать сразу"),
+             "Срабатывать: " + ("на каждый деплой" if t["repeat"] else "только на следующий деплой"),
+             f"Кошелёк: <code>{esc(short(w[2]))}</code>" if w else "Кошелёк: основной",
+             f"Снайпов: {done}" + (f" · не удалось: {failed}" if failed else "")]
+    hist = db.snipe_history(t["id"])
+    if hist:
+        icons = {"done": "✅", "fail": "❌", "skip": "⏭", "run": "⏳"}
+        lines += ["", "Последние:"] + [f"{icons.get(st, '•')} <code>{esc(tok)}</code>" for tok, _, st, _ in hist]
+    i = t["id"]
+    kb = KB([[B("⏸ Пауза" if t["active"] else "▶️ Включить", callback_data=f"sn:act:{i}")],
+             [B(f"💰 Сумма {t['amount']:g} Ⓝ (✏️)", callback_data=f"sn:amt:{i}"),
+              B(f"🍌 Slippage {t['slippage_bps'] / 100:g}% (🔀)", callback_data=f"sn:slip:{i}")],
+             [B((f"📈 TP +{t['tp_pct']:g}%" if t["tp_pct"] > 0 else "📈 TP выкл") + " (✏️)", callback_data=f"sn:tp:{i}"),
+              B(f"Продать на TP {t['tp_sell']:g}% (🔀)", callback_data=f"sn:tps:{i}")],
+             [B((f"🛑 SL −{t['sl_pct']:g}%" if 0 < t["sl_pct"] < 100 else "🛑 SL выкл") + " (✏️)",
+                callback_data=f"sn:sl:{i}"),
+              B("JustHoot: ждать ⏳" if t["jh_wait"] else "JustHoot: сразу ⚡", callback_data=f"sn:jh:{i}")],
+             [B("🔁 Каждый деплой" if t["repeat"] else "1️⃣ Только следующий", callback_data=f"sn:rep:{i}"),
+              B(f"👛 {short(w[2]) if w else 'основной'} (🔀)", callback_data=f"sn:wal:{i}")],
+             [B("🏷 Имя (✏️)", callback_data=f"sn:name:{i}")],
+             [B("⬅️ К списку", callback_data="sn:l"), B("🗑 Удалить", callback_data=f"sn:del:{i}")]])
+    return "\n".join(lines), kb
+
+
+async def show_snipes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, kb = snipes_view(update.effective_user.id)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                              disable_web_page_preview=True)
+
+
+SNIPE_PROMPTS = {"amt": "Сколько NEAR тратить на каждый снайп? (например 0.5)",
+                 "tp": "Тейк-профит: на сколько % вырасти, чтобы продать (например 100). 0 — выключить.",
+                 "sl": "Стоп-лосс: на сколько % упасть, чтобы продать всё (например 50). 0 — выключить.",
+                 "name": "Имя для этого дева (до 24 символов):"}
+
+
+async def on_snipe_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = q.data.split(":")
+    act = parts[1]
+    chat = q.message.chat
+    if act == "l":
+        await q.answer()
+        await edit_or_send(q, *snipes_view(uid))
+        return
+    if act == "add":
+        if not await need_wallet(update):
+            return
+        if len(db.user_snipes(uid)) >= MAX_SNIPES:
+            await q.answer(f"Максимум {MAX_SNIPES} девов", show_alert=True)
+            return
+        await q.answer()
+        ctx.user_data["await"] = ("sn_addr",)
+        await chat.send_message("Отправьте адрес кошелька дева (<code>имя.near</code> или 64 символа):",
+                                parse_mode=ParseMode.HTML, reply_markup=KB([[B("🚫 Отмена", callback_data="lo:pc")]]))
+        return
+    t = db.snipe_target(uid, int(parts[2])) if len(parts) > 2 and parts[2].isdigit() else None
+    if not t:
+        await q.answer("Не найдено", show_alert=True)
+        return
+    i = t["id"]
+    if act == "v":
+        await q.answer()
+    elif act == "act":
+        db.update_snipe(uid, i, active=0 if t["active"] else 1)
+        await q.answer("Включено" if not t["active"] else "На паузе")
+    elif act == "slip":
+        db.update_snipe(uid, i, slippage_bps=next((x for x in SNIPE_SLIPS if x > t["slippage_bps"]), SNIPE_SLIPS[0]))
+        await q.answer()
+    elif act == "tps":
+        db.update_snipe(uid, i, tp_sell=next((x for x in TP_SELLS if x > t["tp_sell"]), TP_SELLS[0]))
+        await q.answer()
+    elif act == "jh":
+        db.update_snipe(uid, i, jh_wait=0 if t["jh_wait"] else 1)
+        await q.answer()
+    elif act == "rep":
+        db.update_snipe(uid, i, repeat=0 if t["repeat"] else 1)
+        await q.answer()
+    elif act == "wal":
+        ws = [w[0] for w in db.wallets(uid)]
+        if ws:
+            cur = t["wallet_id"] if t["wallet_id"] in ws else None
+            db.update_snipe(uid, i, wallet_id=ws[(ws.index(cur) + 1) % len(ws)] if cur else ws[0])
+        await q.answer()
+    elif act in SNIPE_PROMPTS:
+        await q.answer()
+        ctx.user_data["await"] = ("sn_set", i, act)
+        await chat.send_message(SNIPE_PROMPTS[act])
+        return
+    elif act == "del":
+        await q.answer()
+        await chat.send_message(f"🗑 Удалить снайпер «{esc(t['name'] or short(t['dev']))}»?", parse_mode=ParseMode.HTML,
+                                reply_markup=KB([[B("Да, удалить", callback_data=f"sn:delok:{i}"),
+                                                  B("Отмена", callback_data="w:x:0")]]))
+        return
+    elif act == "delok":
+        db.delete_snipe(uid, i)
+        await q.answer("Удалён")
+        await edit_or_send(q, *snipes_view(uid))
+        return
+    else:
+        await q.answer()
+    await edit_or_send(q, *snipe_view(uid, db.snipe_target(uid, i)))
+
+
+async def snipe_input(update: Update, ctx, pending, text: str):
+    uid = update.effective_user.id
+    if pending[0] == "sn_addr":
+        dev = text.strip().lower()
+        if not wallets.ACCOUNT_RE.match(dev):
+            await update.message.reply_text("❌ Неверный адрес кошелька.")
+            return
+        if len(dev) != 64 and not await rpc.account(dev):
+            await update.message.reply_text(f"❌ Аккаунта {dev} не существует.")
+            return
+        if any(t["dev"] == dev for t in db.user_snipes(uid)):
+            await update.message.reply_text("Этот дев уже добавлен.")
+            return
+        sid = db.add_snipe(uid, db.active_wallet(uid), dev, max(slippage_bps(uid), 2000))
+        text_, kb = snipe_view(uid, db.snipe_target(uid, sid))
+        await update.message.reply_text("✅ Дев добавлен — снайпер запущен. Проверьте сумму и TP/SL ниже.\n\n" + text_,
+                                        parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        return
+    _, sid, field = pending
+    t = db.snipe_target(uid, sid)
+    if not t:
+        return
+    if field == "name":
+        db.update_snipe(uid, sid, name=" ".join(text.split())[:24])
+    else:
+        off = text.strip() in ("0", "0%")
+        v = None if off else parse_num(text)
+        if v is None and not (off and field in ("tp", "sl")):
+            await update.message.reply_text("Неверное число.")
+            return
+        v = float(v or 0)
+        if field == "amt":
+            if v < 0.01:
+                await update.message.reply_text("Минимум 0.01 NEAR.")
+                return
+            db.update_snipe(uid, sid, amount=min(v, MAX_BUY / YOCTO))
+        elif field == "tp":
+            db.update_snipe(uid, sid, tp_pct=min(v, 100000))
+        elif field == "sl":
+            if v >= 100:
+                await update.message.reply_text("Стоп-лосс должен быть меньше 100%.")
+                return
+            db.update_snipe(uid, sid, sl_pct=v)
+    text_, kb = snipe_view(uid, db.snipe_target(uid, sid))
+    await update.message.reply_text(text_, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+
+
 # ---------------------------------------------------------------- позиции
 async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = await need_wallet(update)
@@ -2291,7 +2596,7 @@ def parse_num(s: str) -> Decimal | None:
 
 MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_positions, "⚙️ Настройки": show_settings,
                 "↗️ Вывод": cmd_withdraw, "📋 Ордера": show_orders, "🤝 Рефералы": show_ref,
-                "🔁 Копитрейд": show_copies}
+                "🔁 Копитрейд": show_copies, "🎯 Снайпер": show_snipes}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2317,6 +2622,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(detail[0], parse_mode=ParseMode.HTML, reply_markup=detail[1])
         elif kind in ("ct_addr", "ct_set"):
             await copy_input(update, ctx, pending, text)
+        elif kind in ("sn_addr", "sn_set"):
+            await snipe_input(update, ctx, pending, text)
         elif kind == "lo_token":
             await order_token_input(update, ctx, text)
         elif kind in ("lo_amt", "lo_name", "lo_price"):
@@ -2367,22 +2674,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------- запуск
 async def post_init(app: Application):
-    global HUB, APP_BOT
+    global HUB, APP_BOT, SNIPER
     APP_BOT = app.bot
     await app.bot.get_me()  # username для ссылок в карточках из фоновых задач
     HUB = copytrade.Hub(on_leader_trade)
     await copy_sync()
+    SNIPER = snipe.DeployWatcher(on_deploy)
+    asyncio.create_task(_preload_dcl())
     try:
         await ref.refresh_index()
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
     cmds = [("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"), ("orders", "Лимит-ордера"),
-            ("copy", "Копитрейд"),
+            ("copy", "Копитрейд"), ("snipe", "Снайпер деплоера"),
             ("withdraw", "Вывод средств"), ("ref", "Рефералы"), ("settings", "Настройки")]
     await app.bot.set_my_commands([(c, i18n.to_en(d)) for c, d in cmds])
     for lc in ("ru", "uk", "be"):
         await app.bot.set_my_commands(cmds, language_code=lc)
     db.reset_stuck_orders()
+
+
+async def _preload_dcl():
+    """Индекс пулов DCL загружаем заранее, чтобы снайп не тратил на это время."""
+    try:
+        await ref.refresh_dcl_index(force=True)
+    except Exception as e:
+        log.warning("DCL index preload failed (will retry on demand): %s", e)
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2406,6 +2723,8 @@ def main():
     app.add_handler(CommandHandler("orders", show_orders))
     app.add_handler(CommandHandler("copy", show_copies))
     app.add_handler(CallbackQueryHandler(on_copy_cb, pattern=r"^ct:"))
+    app.add_handler(CommandHandler("snipe", show_snipes))
+    app.add_handler(CallbackQueryHandler(on_snipe_cb, pattern=r"^sn:"))
     app.add_handler(CommandHandler("ref", show_ref))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("backup", cmd_backup))
