@@ -2263,7 +2263,6 @@ async def copy_input(update: Update, ctx, pending, text: str):
 MAX_SNIPES = int(os.getenv("MAX_SNIPE_TARGETS", "10"))
 SNIPE_SLIPS = (1000, 2000, 3000, 5000)
 TP_SELLS = (25, 50, 75, 100)
-JH_WAIT_SEC = int(os.getenv("SNIPE_JUSTHOOT_WAIT_SEC", "120"))  # анти-снайп налог JustHoot после запуска
 POOL_WAIT_SEC = int(os.getenv("SNIPE_POOL_WAIT_SEC", "45"))     # сколько ждать появления пула после деплоя
 SNIPER: snipe.DeployWatcher | None = None
 PAD_NAME = {"nearly": "nearly.trade", "justhoot": "JustHoot"}
@@ -2318,10 +2317,6 @@ async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str):
             await tell(head + f"Дев задеплоил <code>{esc(token)}</code> ({dep}), но на кошельке {fmt_near(bal)} Ⓝ — "
                               f"не хватает на {fmt_near(amount)} Ⓝ + газ.")
             return
-        if pad == "justhoot" and t["jh_wait"] and JH_WAIT_SEC > 0:
-            await tell(head + f"Дев задеплоил <code>{esc(token)}</code> ({dep}).\n"
-                              f"⏳ Жду {JH_WAIT_SEC} сек — окончание анти-снайп налога JustHoot, потом куплю.")
-            await asyncio.sleep(JH_WAIT_SEC)
         await wait_pool(token, time.time() + POOL_WAIT_SEC)
         key = (s.account_id, token)
         while key in BUSY:
@@ -2404,7 +2399,6 @@ def snipe_view(uid: int, t: dict) -> tuple[str, KB]:
              f"Покупка: <b>{t['amount']:g} Ⓝ</b> · slippage {t['slippage_bps'] / 100:g}%",
              "Тейк-профит: " + (f"<b>+{t['tp_pct']:g}%</b> → продать {t['tp_sell']:g}%" if t["tp_pct"] > 0 else "выкл"),
              "Стоп-лосс: " + (f"<b>−{t['sl_pct']:g}%</b> → продать всё" if 0 < t["sl_pct"] < 100 else "выкл"),
-             "JustHoot: " + (f"ждать {JH_WAIT_SEC} сек (анти-снайп налог)" if t["jh_wait"] else "покупать сразу"),
              "Срабатывать: " + ("на каждый деплой" if t["repeat"] else "только на следующий деплой"),
              f"Кошелёк: <code>{esc(short(w[2]))}</code>" if w else "Кошелёк: основной",
              f"Снайпов: {done}" + (f" · не удалось: {failed}" if failed else "")]
@@ -2420,10 +2414,9 @@ def snipe_view(uid: int, t: dict) -> tuple[str, KB]:
               B(f"Продать на TP {t['tp_sell']:g}% (🔀)", callback_data=f"sn:tps:{i}")],
              [B((f"🛑 SL −{t['sl_pct']:g}%" if 0 < t["sl_pct"] < 100 else "🛑 SL выкл") + " (✏️)",
                 callback_data=f"sn:sl:{i}"),
-              B("JustHoot: ждать ⏳" if t["jh_wait"] else "JustHoot: сразу ⚡", callback_data=f"sn:jh:{i}")],
-             [B("🔁 Каждый деплой" if t["repeat"] else "1️⃣ Только следующий", callback_data=f"sn:rep:{i}"),
-              B(f"👛 {short(w[2]) if w else 'основной'} (🔀)", callback_data=f"sn:wal:{i}")],
-             [B("🏷 Имя (✏️)", callback_data=f"sn:name:{i}")],
+              B("🔁 Каждый деплой" if t["repeat"] else "1️⃣ Только следующий", callback_data=f"sn:rep:{i}")],
+             [B(f"👛 {short(w[2]) if w else 'основной'} (🔀)", callback_data=f"sn:wal:{i}"),
+              B("🏷 Имя (✏️)", callback_data=f"sn:name:{i}")],
              [B("⬅️ К списку", callback_data="sn:l"), B("🗑 Удалить", callback_data=f"sn:del:{i}")]])
     return "\n".join(lines), kb
 
@@ -2476,9 +2469,6 @@ async def on_snipe_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     elif act == "tps":
         db.update_snipe(uid, i, tp_sell=next((x for x in TP_SELLS if x > t["tp_sell"]), TP_SELLS[0]))
-        await q.answer()
-    elif act == "jh":
-        db.update_snipe(uid, i, jh_wait=0 if t["jh_wait"] else 1)
         await q.answer()
     elif act == "rep":
         db.update_snipe(uid, i, repeat=0 if t["repeat"] else 1)
