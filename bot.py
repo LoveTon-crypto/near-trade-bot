@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import html
+import inspect
 import logging
 import os
 import re
@@ -14,16 +16,18 @@ import time
 from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
-from telegram import (CopyTextButton, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, InputMediaPhoto,
-                      ReplyKeyboardMarkup, Update)
+from telegram import (CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup,
+                      Update)
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, MessageHandler, TypeHandler, filters)
+                          ContextTypes, ExtBot, MessageHandler, TypeHandler, filters)
 
 load_dotenv()
 
 from db import DB
 import market
+import i18n
 from near import KeyPair, Rpc, Signer, RpcError, TxFailed, YOCTO, fmt_near, to_yocto
 from ref import Ref, NoPool, WNEAR
 import wallets
@@ -59,6 +63,74 @@ rpc = Rpc(RPC_URLS, FASTNEAR_API_KEY)
 ref = Ref(rpc)
 vault = Vault(wallets.load_master_key())
 scanner = market.Scanner(rpc)
+
+# ---------------------------------------------------------------- язык
+# Русский — для ru/uk/be в Telegram, остальным английский; переключается в ⚙️ Настройках.
+# Тексты пишутся по-русски, а I18nBot переводит всё исходящее (сообщения, подписи, кнопки, всплывашки) по i18n.EN.
+CUR_LANG: contextvars.ContextVar[str] = contextvars.ContextVar("lang", default="ru")
+
+
+def lang_of(uid: int) -> str:
+    return db.get(f"u{uid}:lang", "ru")
+
+
+def _tr_markup(m):
+    if isinstance(m, InlineKeyboardMarkup):
+        rows = []
+        for row in m.inline_keyboard:
+            r = []
+            for b in row:
+                d = b.to_dict()
+                d["text"] = i18n.to_en(b.text)
+                r.append(InlineKeyboardButton.de_json(d, None))
+            rows.append(r)
+        return InlineKeyboardMarkup(rows)
+    if isinstance(m, ReplyKeyboardMarkup):
+        return ReplyKeyboardMarkup([[i18n.to_en(b.text) for b in row] for row in m.keyboard],
+                                   resize_keyboard=m.resize_keyboard)
+    return m
+
+
+class I18nBot(ExtBot):
+    """ExtBot, который переводит исходящие тексты на английский для пользователей с языком en."""
+
+    async def _i18n(self, name: str, args, kwargs):
+        meth = getattr(super(), name)
+        ba = inspect.signature(meth).bind_partial(*args, **kwargs)
+        a = ba.arguments
+        chat = a.get("chat_id")
+        lang = lang_of(chat) if isinstance(chat, int) and chat > 0 else CUR_LANG.get()
+        if lang == "en":
+            for k in ("text", "caption"):
+                if isinstance(a.get(k), str):
+                    a[k] = i18n.to_en(a[k])
+            if a.get("reply_markup") is not None:
+                a["reply_markup"] = _tr_markup(a["reply_markup"])
+            m = a.get("media")
+            if isinstance(m, InputMediaPhoto) and m.caption:
+                a["media"] = InputMediaPhoto(m.media, caption=i18n.to_en(m.caption), parse_mode=m.parse_mode)
+        return await meth(*ba.args, **ba.kwargs)
+
+    async def send_message(self, *args, **kwargs):
+        return await self._i18n("send_message", args, kwargs)
+
+    async def send_photo(self, *args, **kwargs):
+        return await self._i18n("send_photo", args, kwargs)
+
+    async def edit_message_text(self, *args, **kwargs):
+        return await self._i18n("edit_message_text", args, kwargs)
+
+    async def edit_message_caption(self, *args, **kwargs):
+        return await self._i18n("edit_message_caption", args, kwargs)
+
+    async def edit_message_media(self, *args, **kwargs):
+        return await self._i18n("edit_message_media", args, kwargs)
+
+    async def edit_message_reply_markup(self, *args, **kwargs):
+        return await self._i18n("edit_message_reply_markup", args, kwargs)
+
+    async def answer_callback_query(self, *args, **kwargs):
+        return await self._i18n("answer_callback_query", args, kwargs)
 
 SIGNERS: dict[int, Signer] = {}  # wallet id → Signer (один nonce-замок на кошелёк)
 BUSY: set = set()
@@ -130,7 +202,13 @@ async def guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not update.effective_user or (chat and chat.type != ChatType.PRIVATE):
         raise ApplicationHandlerStop
-    db.ensure_user(update.effective_user.id)
+    u = update.effective_user
+    db.ensure_user(u.id)
+    lang = db.get(f"u{u.id}:lang")
+    if lang is None:
+        lang = "ru" if (u.language_code or "").split("-")[0] in ("ru", "uk", "be") else "en"
+        db.set(f"u{u.id}:lang", lang)
+    CUR_LANG.set(lang)
 
 
 async def need_wallet(update: Update) -> Signer | None:
@@ -1581,7 +1659,8 @@ async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def settings_kb(uid: int):
     cur = slippage_bps(uid)
     row = [B(("✅ " if cur == v else "") + f"{v / 100:g}%", callback_data=f"sl:{v}") for v in (100, 300, 500, 1000, 2000, 3000)]
-    return KB([row[:3], row[3:], [B("✏️ Пресеты покупки: " + " / ".join(presets(uid)), callback_data="pr")]])
+    return KB([row[:3], row[3:], [B("✏️ Пресеты покупки: " + " / ".join(presets(uid)), callback_data="pr")],
+               [B("🌐 Язык: Русский", callback_data="lang")]])
 
 
 async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1596,6 +1675,13 @@ async def on_settings_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db.set(f"u{uid}:slippage_bps", int(q.data[3:]))
         await q.answer("Сохранено")
         await q.edit_message_reply_markup(settings_kb(uid))
+    elif q.data == "lang":
+        new = "en" if lang_of(uid) == "ru" else "ru"
+        db.set(f"u{uid}:lang", new)
+        CUR_LANG.set(new)
+        await q.answer()
+        await q.edit_message_reply_markup(settings_kb(uid))
+        await q.message.chat.send_message("✅ Язык: русский", reply_markup=MENU)  # обновить кнопки меню
     elif q.data == "pr":
         await q.answer()
         ctx.user_data["await"] = ("presets",)
@@ -1617,7 +1703,7 @@ MENU_BUTTONS = {"💼 Кошелёк": show_wallet, "📊 Позиции": show_
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text or ""
+    text = i18n.from_en(update.message.text or "")
     if text in MENU_BUTTONS:  # кнопка меню отменяет любой ввод
         ctx.user_data.pop("await", None)
         await MENU_BUTTONS[text](update, ctx)
@@ -1688,9 +1774,11 @@ async def post_init(app: Application):
         await ref.refresh_index()
     except Exception as e:
         log.warning("Ref index load failed (will retry on demand): %s", e)
-    await app.bot.set_my_commands([("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"),
-                                   ("orders", "Лимит-ордера"), ("withdraw", "Вывод средств"), ("ref", "Рефералы"),
-                                   ("settings", "Настройки")])
+    cmds = [("start", "Главное меню"), ("wallet", "Кошельки"), ("positions", "Позиции"), ("orders", "Лимит-ордера"),
+            ("withdraw", "Вывод средств"), ("ref", "Рефералы"), ("settings", "Настройки")]
+    await app.bot.set_my_commands([(c, i18n.to_en(d)) for c, d in cmds])
+    for lc in ("ru", "uk", "be"):
+        await app.bot.set_my_commands(cmds, language_code=lc)
     db.reset_stuck_orders()
 
 
@@ -1705,7 +1793,7 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
+    app = (Application.builder().bot(I18nBot(BOT_TOKEN)).post_init(post_init).concurrent_updates(True).build())
     app.add_handler(TypeHandler(Update, guard), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("wallet", show_wallet))
@@ -1722,7 +1810,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_transfer_cb, pattern=r"^tr:"))
     app.add_handler(CallbackQueryHandler(on_asset_cb, pattern=r"^wa:"))
     app.add_handler(CallbackQueryHandler(on_trade_cb, pattern=r"^(b|bx|s|sx|c):"))
-    app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$)"))
+    app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$|lang$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_orders, interval=ORDER_POLL, first=20)
