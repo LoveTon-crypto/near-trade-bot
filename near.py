@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import struct
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -158,31 +159,43 @@ class TxFailed(Exception):
 
 
 class Rpc:
-    """JSON-RPC с перебором узлов: таймаут, перегрузка или лимит запросов (429) → следующий узел, потом повтор."""
+    """JSON-RPC с перебором узлов по кругу.
+
+    Ошибка самого NEAR (у nearcore всегда есть поле "name", напр. HANDLER_ERROR) отдаётся наверх.
+    Всё остальное — 429, «endpoint discontinued», «method not found», не-JSON, 5xx — сбой узла:
+    пробуем следующий, а узел, который не умеет нужный метод или закрыт, исключаем на 30 минут.
+    """
+
+    BENCH_SEC = 1800
 
     def __init__(self, urls: list[str], api_key: str = ""):
         self.urls = urls
         self.api_key = api_key
-        self._rr = 0  # по кругу: нагрузка делится между бесплатными узлами, лимит каждого не выбивается
-        self.http = httpx.AsyncClient(timeout=httpx.Timeout(20.0, read=70.0),
+        self._rr = 0
+        self._bench: dict[str, float] = {}  # url → до какого времени не использовать
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0),
                                       headers={"User-Agent": "near-trade-bot/1.0"})
 
     def _headers(self, url: str) -> dict | None:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key and "fastnear" in url else None
 
     @staticmethod
-    def _retryable(err: dict, status: int) -> bool:
-        name = (err.get("cause") or {}).get("name") or err.get("name") or ""
-        text = json.dumps(err)
-        return (name in ("TIMEOUT_ERROR", "INTERNAL_ERROR") or status >= 500 or status == 429
-                or err.get("code") == -429 or "Rate limit" in text or "rate limit" in text)
+    def _is_chain_error(err: dict) -> bool:
+        name = err.get("name") or ""
+        if name in ("TIMEOUT_ERROR", "INTERNAL_ERROR"):
+            return False
+        return bool(name)  # HANDLER_ERROR / REQUEST_VALIDATION_ERROR — настоящий ответ NEAR
+
+    def _order(self) -> list[str]:
+        now = time.time()
+        live = [u for u in self.urls if self._bench.get(u, 0) < now] or list(self.urls)
+        self._rr = (self._rr + 1) % len(live)
+        return live[self._rr:] + live[:self._rr]
 
     async def call(self, method: str, params) -> dict:
         last = None
-        self._rr = (self._rr + 1) % len(self.urls)
-        order = self.urls[self._rr:] + self.urls[:self._rr]
         for attempt in range(3):
-            for url in order:
+            for url in self._order():
                 try:
                     r = await self.http.post(url, json={"jsonrpc": "2.0", "id": "t", "method": method, "params": params},
                                              headers=self._headers(url))
@@ -190,14 +203,24 @@ class Rpc:
                 except (httpx.HTTPError, ValueError) as e:
                     last = e
                     continue
+                if not isinstance(data, dict):
+                    last = RpcError(f"{url}: bad response")
+                    continue
                 if "error" in data:
                     err = data["error"] if isinstance(data["error"], dict) else {"message": str(data["error"])}
-                    if self._retryable(err, r.status_code):
-                        last = RpcError(json.dumps(err)[:300])
-                        continue
-                    raise RpcError(json.dumps(err)[:800])
+                    if self._is_chain_error(err):
+                        raise RpcError(json.dumps(err)[:800])
+                    text = json.dumps(err)
+                    if err.get("code") == -32601 or "discontinued" in text or "not exist" in text or r.status_code in (401, 403, 404):
+                        self._bench[url] = time.time() + self.BENCH_SEC
+                        log.warning("RPC %s benched: %s", url, text[:120])
+                    last = RpcError(text[:300])
+                    continue
                 if "result" not in data:
-                    last = RpcError(str(data)[:300])
+                    if r.status_code in (401, 403, 404, 410) or "discontinued" in str(data):
+                        self._bench[url] = time.time() + self.BENCH_SEC
+                        log.warning("RPC %s benched: %s", url, str(data)[:120])
+                    last = RpcError(f"{url}: {str(data)[:200]}")
                     continue
                 return data["result"]
             await asyncio.sleep(0.6 * (attempt + 1))
