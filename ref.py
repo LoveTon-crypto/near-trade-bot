@@ -65,6 +65,7 @@ class Ref:
         self.dcl_indexed = 0
         self.dcl_index_ts = 0.0
         self._dcl_lock = asyncio.Lock()
+        self._reg: set[tuple[str, str]] = set()  # (токен, аккаунт) с оплаченным storage
 
     # ------------------------------------------------------------ пулы
     async def refresh_index(self):
@@ -248,10 +249,15 @@ class Ref:
         storage = int(a.get("storage_usage", 0)) * 10 ** 19
         return max(int(a["amount"]) - storage, 0)
 
-    async def ensure_storage(self, s: Signer, token: str):
-        reg = await self.rpc.view(token, "storage_balance_of", {"account_id": s.account_id})
-        if reg:
-            return
+    async def _registered(self, token: str, account: str) -> bool:
+        if (token, account) in self._reg:
+            return True
+        ok = bool(await self.rpc.view(token, "storage_balance_of", {"account_id": account}))
+        if ok:
+            self._reg.add((token, account))
+        return ok
+
+    async def _register(self, s: Signer, token: str, wait: str = "EXECUTED_OPTIMISTIC"):
         try:
             bounds = await self.rpc.view(token, "storage_balance_bounds")
             dep = int((bounds or {}).get("min") or DEFAULT_STORAGE)
@@ -260,7 +266,12 @@ class Ref:
         if dep > YOCTO // 10:
             raise TxFailed(f"токен просит необычно большой storage-депозит ({dep / YOCTO} NEAR), отменено")
         await s.send(token, [FunctionCall("storage_deposit", {"account_id": s.account_id, "registration_only": True},
-                                          gas=30 * TGAS, deposit=dep)])
+                                          gas=30 * TGAS, deposit=dep)], wait=wait)
+        self._reg.add((token, s.account_id))
+
+    async def ensure_storage(self, s: Signer, token: str):
+        if not await self._registered(token, s.account_id):
+            await self._register(s, token)
 
     async def total_supply(self, token: str) -> int:
         hit = self._supply.get(token)
@@ -332,16 +343,22 @@ class Ref:
         return FunctionCall("ft_transfer_call", {"receiver_id": to, "amount": str(amount), "msg": msg},
                             gas=180 * TGAS, deposit=ONE_YOCTO)
 
-    async def buy(self, s: Signer, token: str, near_in: int, slippage_bps: int) -> dict:
-        r = await self.route(token, fresh=True)
+    async def buy(self, s: Signer, token: str, near_in: int, slippage_bps: int, route: Route | None = None,
+                  fast: bool = False) -> dict:
+        """fast (снайпер): маршрут уже найден, проверки идут параллельно, а регистрацию в токене не ждём до
+        исполнения — свап проходит через wrap.near и Ref на несколько блоков дольше, регистрация успевает раньше."""
+        r = route or await self.route(token, fresh=True)
         pool_id = r.pool_id
-        expected = await self.quote_route(r, WNEAR, near_in, token)
+        expected, reg_tok, reg_w, before = await asyncio.gather(
+            self.quote_route(r, WNEAR, near_in, token), self._registered(token, s.account_id),
+            self._registered(WNEAR, s.account_id), self.ft_balance(token, s.account_id))
         if expected <= 0:
             raise TxFailed("котировка 0 — в пуле нет ликвидности")
         min_out = expected * (10_000 - slippage_bps) // 10_000
-        await self.ensure_storage(s, token)
-        await self.ensure_storage(s, WNEAR)
-        before = await self.ft_balance(token, s.account_id)
+        if not reg_w:
+            await self._register(s, WNEAR)
+        if not reg_tok:
+            await self._register(s, token, wait="INCLUDED" if fast else "EXECUTED_OPTIMISTIC")
         try:
             res = await s.send(WNEAR, [
                 FunctionCall("near_deposit", {}, gas=10 * TGAS, deposit=near_in),

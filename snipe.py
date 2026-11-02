@@ -85,8 +85,10 @@ class DeployWatcher:
     async def find_dev(self, token: str, height) -> tuple[str, str]:
         if not isinstance(height, int):
             return "", ""
-        for h in (height, height - 1, height + 1, height - 2, height - 3):
-            for d in parse_block(await self.block(h) or {}):
+        hs = (height, height - 1, height + 1, height - 2, height - 3)
+        blocks = await asyncio.gather(*(self.block(h) for h in hs))  # все сразу, а не по очереди
+        for blk in blocks:
+            for d in parse_block(blk or {}):
                 if d["token"] == token:
                     dev = d["signer"]
                     if not dev or dev in FACTORIES:
@@ -94,7 +96,7 @@ class DeployWatcher:
                     return dev, d["tx"]
         return "", ""
 
-    async def _handle(self, token: str, fac: str, height):
+    async def _handle(self, token: str, fac: str, height, tm: dict):
         try:
             dev, tx = await asyncio.wait_for(self.find_dev(token, height), timeout=6)
         except asyncio.TimeoutError:
@@ -102,9 +104,10 @@ class DeployWatcher:
         if not dev:
             log.info("snipe: dev of %s not found", token)
             return
+        tm["dev"] = time.time()
         log.info("snipe: deploy %s by %s", token, dev)
         try:
-            await self.on_deploy(token, fac, dev, tx)
+            await self.on_deploy(token, fac, dev, tx, tm)
         except Exception:
             log.exception("snipe on_deploy %s", token)
 
@@ -139,7 +142,11 @@ class DeployWatcher:
                             if fac and acc not in self.seen:
                                 self.seen[acc] = time.time()
                                 self.deploys += 1
-                                asyncio.create_task(self._handle(acc, fac, msg.get("height")))
+                                tm = {"seen": time.time()}
+                                ts = msg.get("timestamp_millis") or msg.get("created_at_millis")
+                                if isinstance(ts, (int, float)) and ts > 1e12:
+                                    tm["deploy"] = ts / 1000
+                                asyncio.create_task(self._handle(acc, fac, msg.get("height"), tm))
                         if len(self.seen) > 5000:
                             cut = time.time() - 3600
                             self.seen = {k: v for k, v in self.seen.items() if v > cut}

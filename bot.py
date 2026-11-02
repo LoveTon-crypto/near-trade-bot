@@ -912,10 +912,10 @@ def wallet_id_of(uid: int, account: str) -> int | None:
     return r[0] if r else None
 
 
-async def swap_buy(uid: int, s: Signer, token: str, amount: int, slip: int) -> dict:
+async def swap_buy(uid: int, s: Signer, token: str, amount: int, slip: int, route=None, fast: bool = False) -> dict:
     """Покупка на amount NEAR: свапается amount − комиссия, комиссия уходит после успешного свапа."""
     fee = fee_of(amount, s.account_id)
-    r = await ref.buy(s, token, amount - fee, slip)
+    r = await ref.buy(s, token, amount - fee, slip, route=route, fast=fast)
     if fee:
         schedule_fee(uid, s, "buy", fee, r["hash"])
     return r
@@ -2277,14 +2277,14 @@ SNIPER: snipe.DeployWatcher | None = None
 PAD_NAME = {"nearly": "nearly.trade", "justhoot": "JustHoot"}
 
 
-async def on_deploy(token: str, fac: str, dev: str, tx: str):
+async def on_deploy(token: str, fac: str, dev: str, tx: str, tm: dict | None = None):
     for t in db.snipes_of(dev):
         if db.claim_snipe(t["id"], token):
-            asyncio.create_task(run_snipe(t, token, snipe.FACTORIES.get(fac, fac), tx))
+            asyncio.create_task(run_snipe(t, token, snipe.FACTORIES.get(fac, fac), tx, dict(tm or {})))
 
 
 async def wait_pool(token: str, deadline: float):
-    delay = 0.8
+    delay = 0.3
     while True:
         try:
             return await ref.route(token, fresh=True)
@@ -2296,11 +2296,15 @@ async def wait_pool(token: str, deadline: float):
                 raise
             log.info("snipe pool %s: %s", token, str(e)[:100])
         await asyncio.sleep(delay)
-        delay = min(delay * 1.4, 3)
+        delay = min(delay * 1.3, 1.5)
 
 
-async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str):
+async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str, tm: dict | None = None):
     uid, sid = t["user_id"], t["id"]
+    tm = tm or {}
+
+    def mark(k):
+        tm[k] = time.time()
     who = esc(t["name"] or short(t["dev"]))
     head = f"🎯 <b>Снайпер</b> · {who} · {PAD_NAME.get(pad, pad)}\n"
 
@@ -2326,15 +2330,21 @@ async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str):
             await tell(head + f"Дев задеплоил <code>{esc(token)}</code> ({dep}), но на кошельке {fmt_near(bal)} Ⓝ — "
                               f"не хватает на {fmt_near(amount)} Ⓝ + газ.")
             return
-        await wait_pool(token, time.time() + POOL_WAIT_SEC)
+        mark("start")
+        route = await wait_pool(token, time.time() + POOL_WAIT_SEC)
+        mark("pool")
         key = (s.account_id, token)
         while key in BUSY:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.05)
         BUSY.add(key)
         try:
-            r = await swap_buy(uid, s, token, amount, t["slippage_bps"])
+            r = await swap_buy(uid, s, token, amount, t["slippage_bps"], route=route, fast=True)
         finally:
             BUSY.discard(key)
+        mark("bought")
+        base = tm.get("deploy") or tm.get("seen") or tm["start"]
+        log.info("snipe timing %s: %s", token, " ".join(f"{k}=+{v - base:.2f}s" for k, v in
+                                                        sorted(tm.items(), key=lambda kv: kv[1])))
         db.add_trade(s.account_id, token, "buy", r["got"], amount, r["hash"])
         db.snipe_done(sid, token, "done", tx=r["hash"])
         if not t["repeat"]:
