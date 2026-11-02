@@ -177,8 +177,11 @@ _N_SHAPES = [
 ]
 
 
-def coin(d, x, y, r, fill=(255, 255, 255), bg=(0, 0, 0), ss: int = 4, ring=None):
-    """Монета NEAR: чёрный круг с белой «N» (рисуем с запасом и уменьшаем — без зубцов)."""
+NEAR_GREEN = (0, 236, 151)  # #00EC97 — фирменный зелёный NEAR
+
+
+def coin(d, x, y, r, fill=(0, 0, 0), bg=NEAR_GREEN, ss: int = 4, ring=None):
+    """Монета NEAR: зелёный круг с чёрной «N», как лого (рисуем с запасом и уменьшаем — без зубцов)."""
     big = Image.new("RGBA", (2 * r * ss, 2 * r * ss), (0, 0, 0, 0))
     bd = ImageDraw.Draw(big)
     bd.ellipse((0, 0, 2 * r * ss - 1, 2 * r * ss - 1), fill=ring or bg)
@@ -244,7 +247,7 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
         d.text((left, y), label, font=font(40), fill=(255, 255, 255))
         vw = d.textlength(val, font=font(40))
         d.text((right - 58 - vw, y), val, font=font(40), fill=(255, 255, 255))
-        coin(d, right - 22, y + 24, 22, ring=(255, 255, 255))
+        coin(d, right - 22, y + 24, 22)
         y += 62
     if hold:
         d.text((left, y + 4), "HOLD", font=font(28), fill=(200, 210, 230))
