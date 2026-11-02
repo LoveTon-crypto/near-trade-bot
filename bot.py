@@ -718,7 +718,7 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
 
     async def _mkt():
         try:
-            return await scanner.card(token, with_chart=False, with_holders=False)  # график — по кнопке
+            return await scanner.card(token, with_chart=True, with_holders=False)
         except Exception as e:
             log.info("market %s: %s", token, e)
             return None
@@ -807,62 +807,24 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
         lines.append("")
         lines.append(" • ".join(f'<a href="{esc(u)}">{esc(lb)}</a>' for lb, u in c.links[:4]))
 
-    png = None  # график больше не ждём — он по кнопке «📈 График»
+    png = None
+    if c and len(c.candles) >= 3:
+        if not c.symbol or c.symbol == "?":
+            c.symbol = sym
+        try:
+            png = await asyncio.to_thread(market.render_chart, c)
+        except Exception as e:
+            log.info("chart %s: %s", token, e)
     pr = presets(uid)
     kb = KB([
         [B(f"🟢 {a} Ⓝ", callback_data=f"b:{a}:{tid}") for a in pr[:4]],
-        [B("🟢 ✏️ X Ⓝ", callback_data=f"bx:{tid}"), B("📈 График", callback_data=f"ch:{tid}"),
-         B("🔄 Обновить", callback_data=f"c:{tid}")],
+        [B("🟢 ✏️ X Ⓝ", callback_data=f"bx:{tid}"), B("🔄 Обновить", callback_data=f"c:{tid}")],
         [B("🔴 25%", callback_data=f"s:25:{tid}"), B("🔴 50%", callback_data=f"s:50:{tid}"),
          B("🔴 100%", callback_data=f"s:100:{tid}"), B("🔴 ✏️ X%", callback_data=f"sx:{tid}")],
         [B("📋 Лимит-ордер", callback_data=f"lo:new:{tid}")]
         + ([B("📤 Поделиться PnL", callback_data=f"pn:{tid}")] if has_pos else []),
     ])
     return "\n".join(lines), kb, png
-
-
-CHART_BUSY: set[tuple[int, str]] = set()
-
-
-async def on_chart_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """📈 График: свечи 15m за сутки отдельным сообщением с картинкой."""
-    q = update.callback_query
-    uid = q.from_user.id
-    token = _token_from_cb(q.data.split(":", 1)[1])
-    if not token:
-        await q.answer("Токен не найден", show_alert=True)
-        return
-    if (uid, token) in CHART_BUSY:
-        await q.answer("⏳ Строю график…")
-        return
-    CHART_BUSY.add((uid, token))
-    await q.answer("⏳ Строю график…")
-    try:
-        try:
-            c = await scanner.card(token, with_chart=True, with_holders=False)
-        except Exception as e:
-            log.info("chart %s: %s", token, e)
-            c = None
-        png = None
-        if c and len(c.candles) >= 3:
-            try:
-                png = await asyncio.to_thread(market.render_chart, c)
-            except Exception as e:
-                log.info("chart render %s: %s", token, e)
-        tid = db.token_id(token)
-        kb = KB([[B("🔄 Обновить график", callback_data=f"ch:{tid}"), B("📊 Токен", callback_data=f"c:{tid}")]])
-        sym = esc(c.symbol if c and c.symbol != "?" else token)
-        if not png:
-            await q.message.chat.send_message(f"📈 Для ${sym} пока нет свечей — токен слишком новый или по нему не было "
-                                              f"сделок. Попробуйте через пару минут.", reply_markup=kb)
-            return
-        cap = [f"📈 <b>${sym}</b> · свечи 15m за сутки"]
-        if c.price:
-            cap.append(f"💲 {market.price_fmt(c.price)} · MC {k_usd(c.fdv)}"
-                       + (f" · ATH MC {k_usd(c.ath_mcap)}" if c.ath_mcap > c.fdv * 1.01 else ""))
-        await q.message.chat.send_photo(png, caption="\n".join(cap), parse_mode=ParseMode.HTML, reply_markup=kb)
-    finally:
-        CHART_BUSY.discard((uid, token))
 
 
 def find_token(text: str) -> str | None:
@@ -2778,7 +2740,6 @@ def main():
     app.add_handler(CallbackQueryHandler(on_wallet_cb, pattern=r"^w:"))
     app.add_handler(CallbackQueryHandler(on_transfer_cb, pattern=r"^tr:"))
     app.add_handler(CallbackQueryHandler(on_asset_cb, pattern=r"^wa:"))
-    app.add_handler(CallbackQueryHandler(on_chart_cb, pattern=r"^ch:"))
     app.add_handler(CallbackQueryHandler(on_trade_cb, pattern=r"^(b|bx|s|sx|c):"))
     app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$|lang$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

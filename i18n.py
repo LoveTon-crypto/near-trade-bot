@@ -357,14 +357,6 @@ EN: dict[str, str] = {
     '🗑 Удалить снайпер «': '🗑 Delete sniper «',
     ' через ': ' via ',
 
-    # chart button
-    '⏳ Строю график…': '⏳ Building the chart…',
-    '</b> · свечи 15m за сутки': '</b> · 15m candles, last 24h',
-    '📈 График': '📈 Chart',
-    '🔄 Обновить график': '🔄 Refresh chart',
-    '📈 Для $': '📈 No candles for $',
-    ' пока нет свечей — токен слишком новый или по нему не было сделок. Попробуйте через пару минут.': ' yet — the token is too new or has no trades. Try again in a couple of minutes.',
-
     # language switch
     "🌐 Язык: Русский": "🌐 Language: English", "✅ Язык: русский": "✅ Language: English",
 }
