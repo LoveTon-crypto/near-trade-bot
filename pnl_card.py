@@ -6,7 +6,6 @@ e.g. your coins' mascots) plus the built-in sticker characters from characters.p
 from __future__ import annotations
 
 import io
-import math
 import os
 import random
 
