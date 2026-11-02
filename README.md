@@ -1,117 +1,119 @@
-# NEAR Trade Bot
+# NDBOT — Telegram trading bot for NEAR memecoins
 
-Трейд-бот для NEAR в Telegram: кошельки (создание и импорт по сид-фразе, перевод), покупка и продажа
-токенов через Ref Finance, позиции с PnL, слиппедж. Работает для всех пользователей, только в личке.
+**Trade NEAR memecoins at meme speed, right inside Telegram:** instant token cards, one-tap buys and sells, a deployer sniper for nearly.trade and JustHoot, copytrade, limit orders with TP/SL, and shareable PnL cards. Wallet keys are encrypted per user, and every transaction is built and signed by the bot's own code — no third-party NEAR SDK.
 
-## Как устроена безопасность
+**Try it live:** [@ndegen_bot](https://t.me/ndegen_bot) · 🇷🇺 [README на русском](README.ru.md) (server setup guide)
 
-| Что | Как |
+Built at **NEAR HACKATHON** — tracks: *Unstoppable DeFi*, *Memecoins With Mechanics*, *Social Money*, *Open Innovation*.
+Second project of the same author: **[NEAR Analyzer Bot](https://github.com/LoveTon-crypto/near-analyzer-bot)** (scanner, wallet PnL, memepad alerts, deploys feed). The two work together: every analyzer alert has a **⚡ Buy on NDbot** button that opens this bot on that token — see [Works with NEAR Analyzer](#works-with-near-analyzer).
+
+---
+
+## Why
+
+Memecoins on NEAR launch on memepads (**nearly.trade**, **JustHoot**) and trade on **Ref Finance / Ref DCL** pools. On TON and Solana, traders have Telegram trading bots (DTrade, Trojan, BonkBot…) with sniping, copytrade and limit orders. NEAR had none of that: you had to open a web wallet, find the right pool, sign every swap by hand and track PnL in a spreadsheet. NDBOT brings the full trading-bot toolkit to NEAR.
+
+## Features
+
+| Feature | What it does |
 |---|---|
-| Ключи кошельков | в базе только в зашифрованном виде: AES-256-GCM под `MASTER_KEY` из `.env`. Утечка одной базы ключи не раскрывает. Каждая запись привязана к своему пользователю и адресу — подменить чужую нельзя |
-| Сид-фразы | стандарт BIP39 (12 слов), путь m/44'/397'/0' — как в Meteor и MyNearWallet. BIP39 и деривация написаны в `wallets.py`, без сторонних библиотек; проверены тестовыми векторами BIP39, SLIP-10 и near-seed-phrase |
-| Сообщения с ключами | сид-фразу при импорте бот сразу удаляет из чата; показ фразы — только после подтверждения, под спойлером, с запретом пересылки, и само удаляется через 2 мин |
-| Доступ | каждый видит и подписывает только свои кошельки; группы и каналы игнорируются |
-| Лимиты | максимум NEAR на одну покупку (`MAX_BUY_NEAR`), резерв на газ, до 10 кошельков на пользователя |
-| Подпись транзакций | своим кодом (`near.py`), без сторонних NEAR-библиотек; пул и котировка читаются прямо из контракта Ref |
-| Процесс | отдельный системный пользователь `tradebot` без входа и sudo, изоляция systemd, без swap и core-дампов |
-| Сервер | отдельный VPS, firewall (открыт только SSH), fail2ban, автообновления, вход только по SSH-ключу |
+| 👛 **Wallets** | Create a wallet (BIP39 12-word seed, NEAR path m/44'/397'/0' — compatible with Meteor / MyNearWallet) or import by seed phrase / private key; the bot finds named `name.near` accounts bound to the key. Up to 10 wallets per user, switch the active one, rename, show seed (spoiler, auto-deleted), transfer NEAR and tokens, delete |
+| 📊 **Instant token cards** | Paste a contract or a nearly.trade / JustHoot / NearBlocks link → price in $ and NEAR, MC, liquidity, 24h volume and txns, ATH MC, age, socials, 15-minute candle chart, your position with invested / current value / PnL, and the pool the swap will use. All data is fetched in parallel |
+| ⚡ **One-tap trading** | Buy presets (0.5 / 1 / 2 / 5 NEAR, editable) or a custom amount; sell 25 / 50 / 100 % or a custom %. Per-user slippage |
+| 🔀 **Smart routing** | Picks the deepest wNEAR pool across classic Ref pools and Ref DCL (concentrated liquidity), including multi-hop DCL routes (wNEAR → base token → memecoin) for tokens paired against something other than wNEAR. Quotes come straight from the contracts |
+| 🎯 **Deployer sniper** | Follow dev wallets. When one deploys a new token on nearly.trade or JustHoot, the bot buys automatically (waits for the pool if it appears a few blocks later) and places take-profit / stop-loss orders. Per dev: amount, slippage, TP % and share to sell, SL %, every deploy or next one only, wallet |
+| 🔁 **Copytrade** | Mirror any wallet in real time: fixed amount or % of the leader's trade with a cap, min leader trade filter, sells copied as the same share of the position. Multi-hop swaps are merged into one net trade; stale or missed trades are never copied |
+| 📋 **Limit orders** | Buy the dip / breakout, take-profit, stop-loss — target in NEAR price, $ price, % or market cap. Checked every 10 s; when a position is fully closed, the remaining sell orders for it are cancelled |
+| 🖼 **PnL cards** | After every sell (manual, order, copytrade) the bot sends a share-ready PnL card with the user's referral link; random characters with a green/red chart, or the user's own uploaded pictures |
+| 🤝 **3-level referrals** | Each user gets a referral link; inviters earn a share of the bot fee from 3 levels (30 / 10 / 5 %) and withdraw it to their wallet in one tap |
+| 📈 **Positions** | All tokens on the active wallet with value in NEAR and PnL |
+| 🌐 **EN / RU** | Language follows Telegram, switchable in settings |
+| 🛠 **Admin** | `/admin` — fees, referral liabilities, payout wallet; `/rpc` — RPC node health; `/backup` + daily automatic database backup to the admins' Telegram |
 
-**MASTER_KEY — главный секрет.** Его создаёт `deploy.sh` при первом запуске. Сохраните копию офлайн:
-без него ни один кошелёк в боте не откроется (сид-фразы пользователей при этом продолжают работать в любом NEAR-кошельке).
-С ним и базой можно получить все ключи — поэтому сервер должен быть отдельным и защищённым.
+### Business model
+A 1 % fee (`FEE_BPS`) on each trade is sent to the fee account in a separate transfer after a successful swap (retried in the background if it fails). Referral rewards are paid from it. This keeps the bot sustainable without tokens or subscriptions.
 
-**Правило:** держите в боте только торговый банк. Основные средства — на вашем обычном кошельке.
+## Architecture
 
----
-
-## Установка на новый сервер
-
-Подойдёт любой VPS с Ubuntu 22.04/24.04 и 1 ГБ RAM (например, ещё один у InterServer или Hetzner CX22). **Не ставьте на сервер с другими ботами.**
-
-### 1. SSH-ключ вместо пароля (Termius)
-1. В Termius: **Keychain → Generate Key** (ed25519).
-2. Нажмите **Export to host** и выберите новый сервер.
-3. Проверьте, что Termius заходит без пароля.
-4. Только после этого отключите вход по паролю:
-   ```bash
-   sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-   systemctl restart ssh
-   ```
-
-### 2. Защита сервера
-Загрузите файл `server-setup.sh` на сервер (в Termius: **SFTP** → перетащите файл в `/root`) и выполните:
-```bash
-bash /root/server-setup.sh
+```
+Telegram ─► bot.py ── UI, handlers, orders, sniper, copytrade, referrals, PnL (python-telegram-bot)
+              │
+              ├─ wallets.py   BIP39 + SLIP-10 ed25519 derivation, AES-256-GCM vault (own code, no NEAR SDK)
+              ├─ near.py      transaction building / signing (borsh), RPC client with node scoring + hedged reads
+              ├─ ref.py       Ref Finance + Ref DCL: pool discovery, quotes, multi-hop routes, swaps, storage
+              ├─ market.py    DexScreener, GeckoTerminal, nearly.trade API → card data and candle charts
+              ├─ snipe.py     new-token stream (Intear WS) + deploy signer lookup (neardata blocks)
+              ├─ copytrade.py leader trades stream (Intear WS), per-transaction aggregation
+              ├─ pnl_card.py  PnL card renderer (Pillow) with pnl_images/ characters
+              ├─ i18n.py      RU → EN translation layer for every outgoing message and button
+              └─ db.py        SQLite: users, wallets (encrypted), trades, orders, fees, referrals, snipe / copy targets
 ```
 
-### 3. Код из приватного репозитория
-Создайте на GitHub **приватный** репозиторий `near-trade-bot` и загрузите туда файлы.
+On-chain flow of a buy: `wrap.near` `near_deposit` + `ft_transfer_call` to `v2.ref-finance.near` (classic pool) or `dclv2.ref-labs.near` (DCL `Swap` with one or two `pool_ids`) in a single transaction, with `min_output_amount` from the on-chain quote and the user's slippage. Storage deposits for the token are added automatically; leftover wNEAR is unwrapped back to NEAR.
 
-Чтобы сервер мог его скачивать, дайте ему ключ только на чтение:
+## Security
+
+| What | How |
+|---|---|
+| Wallet keys | Stored only encrypted: AES-256-GCM under `MASTER_KEY`, each record bound to its user and account (AAD), so records can't be swapped between users. A leaked database alone reveals nothing |
+| Seed phrases | Deleted from the chat right after import; shown only after confirmation, under a spoiler, protected from forwarding, auto-deleted after 2 min |
+| Signing | Own ed25519 / borsh code in `near.py`, verified with BIP39, SLIP-10 and near-seed-phrase test vectors (`tests/test_wallets.py`). One nonce lock per wallet, so parallel orders never collide |
+| Access | Each user sees and signs only their own wallets; groups and channels are ignored |
+| Limits | Max NEAR per buy, gas reserve, max wallets / orders / snipe / copy targets per user |
+| Server | Dedicated VPS, systemd sandbox (`ProtectSystem=strict`, no shell user), firewall with only SSH open, fail2ban, key-only SSH; `.env` and the database are `chmod 600` |
+
+**Rule for users:** keep only a trading bank in the bot; main funds stay in your own wallet. Seed phrases created by the bot work in any NEAR wallet.
+
+## Run it
+
+Requires Python 3.11+ and a bot token from [@BotFather](https://t.me/BotFather).
+
 ```bash
-sudo -u tradebot mkdir -p -m 700 /opt/near-trade-bot/.ssh
-sudo -u tradebot ssh-keygen -t ed25519 -f /opt/near-trade-bot/.ssh/id_ed25519 -N ""
-cat /opt/near-trade-bot/.ssh/id_ed25519.pub
-```
-Этот ключ добавьте на GitHub: **репозиторий → Settings → Deploy keys → Add** (галочку *write* НЕ ставить).
-
-Затем:
-```bash
-cd /opt/near-trade-bot
-sudo -u tradebot git init -q && sudo -u tradebot git remote add origin git@github.com:LoveTon-crypto/near-trade-bot.git
-sudo -u tradebot git fetch -q origin main   # на вопрос про github.com ответьте yes
-sudo -u tradebot git reset -q --hard origin/main
-sudo -u tradebot python3 -m venv venv
-```
-
-### 4. Настройки и запуск
-```bash
-sudo -u tradebot cp .env.example .env
-sudo -u tradebot nano .env      # BOT_TOKEN, лимиты
-chmod 600 .env
-bash deploy.sh                  # создаст MASTER_KEY, поставит библиотеки и запустит бота
-grep MASTER_KEY .env            # сохраните это значение офлайн!
-```
-Токен создайте у @BotFather для **нового** бота. Дальше в Telegram: `/start` → 💼 Кошелёк → ➕ Создать или 📥 Импорт.
-
-Если раньше кошелёк создавался старой командой `keystore.py new`: выполните
-`sudo -u tradebot venv/bin/python keystore.py export`, введите пароль и импортируйте показанный ключ в боте.
-
-### Обновление
-```bash
-tradebot-update
+git clone https://github.com/LoveTon-crypto/near-trade-bot && cd near-trade-bot
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# put BOT_TOKEN in .env and generate the vault key:
+echo "MASTER_KEY=$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')" >> .env
+venv/bin/python bot.py
 ```
 
----
+Open the bot in Telegram → `/start` → **💼 Wallet → ➕ Create** → top up the address with a little NEAR → paste a token, e.g. `batman-4.nearlytrade.near`, and tap a buy button. Start with small amounts.
 
-## Как пользоваться
-- **💼 Кошелёк** — список кошельков (✅ — основной, с него идут сделки), ➕ создать, 📥 импорт по сид-фразе или ключу
-  (бот сам находит именованный аккаунт `имя.near`, привязанный к ключу). В карточке кошелька: адрес и баланс,
-  пополнение, перевод NEAR на любой адрес, переименование, показ сид-фразы, удаление.
-- Отправьте адрес токена (`batman-4.nearlytrade.near`) или ссылку nearly / justhoot / nearblocks — откроется карточка с кнопками **Купить** (пресеты и своя сумма) и **Продать** (25 / 50 / 100 % или свой процент).
-- **📊 Позиции** — токены, их стоимость в NEAR и PnL.
-- **⚙️ Настройки** — слиппедж, пресеты покупки.
+Production install on a hardened server (`server-setup.sh`, `deploy.sh`, `tradebot.service`, one-command updates) is described step by step in [README.ru.md](README.ru.md).
 
-## Копитрейд
-- «🔁 Копитрейд»: добавьте кошелёк трейдера — бот в реальном времени (Intear events API) видит его сделки
-  и повторяет их с вашего кошелька: покупка на фиксированную сумму или % от суммы лидера (с потолком «макс.»),
-  продажа — та же доля позиции. Фильтр «мин. сделка лидера», slippage, выбор кошелька, пауза.
-- Копируются только сделки токен ↔ NEAR, совершённые после подписки (старые и пропущенные при переподключении — никогда).
-  Каждая сделка лидера повторяется ровно один раз.
+### Tests
 
-## Комиссия и рефералка
-- С каждой сделки (покупка, продажа, лимит-ордер) бот берёт `FEE_BPS` (по умолчанию 1%) и отправляет на `FEE_ACCOUNT`
-  отдельным переводом после успешного свапа. Если перевод не прошёл — бот повторяет его в фоне.
-- 3 уровня рефералов: `REF_SHARES=30,10,5` — % от комиссии пригласившим. Доход копится на балансе в разделе
-  «🤝 Рефералы» и выводится на кошелёк пользователя с `FEE_ACCOUNT` (от `REF_MIN_WITHDRAW_NEAR`).
-- Ключ кошелька выплат задаётся на сервере, в чат он не попадает: `sudo -u tradebot venv/bin/python admin.py payout-key`.
-- `/admin` (для `ADMIN_IDS`) — собранные комиссии, начисления, долг рефералам, баланс кошелька выплат.
+```bash
+venv/bin/python tests/test_wallets.py   # BIP39 / SLIP-10 / NEAR key derivation and vault, offline
+venv/bin/python tests/test_i18n.py      # every user-facing Russian string has an English translation
+```
 
-## Сначала проверка малыми суммами
-Код транзакций проверен тестами офлайн, но в сети ещё не запускался.
-Первые сделки делайте на 0.1–0.5 NEAR и проверяйте каждую на nearblocks.
+### Configuration (`.env`)
 
-## Дальше (следующие этапы)
-- покупка на мемпадах nearly.trade и justhoot до миграции;
-- снайпер по деплою и новым пулам;
-- копи-трейдинг и лимитные ордера.
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_TOKEN` | — | Telegram bot token |
+| `MASTER_KEY` | — | 32-byte base64 vault key. **Back it up offline** — without it no wallet in the database can be opened |
+| `ADMIN_IDS` | — | Telegram ids allowed to use `/admin`, `/rpc`, `/backup` |
+| `MAX_BUY_NEAR` / `GAS_RESERVE_NEAR` | 100 / 0.1 | Per-buy cap and NEAR kept for gas |
+| `FEE_BPS` / `FEE_ACCOUNT` / `REF_SHARES` | 100 / … / 30,10,5 | Bot fee, fee wallet, referral shares per level |
+| `RPC_URLS` / `FASTNEAR_API_KEY` | free public nodes | RPC list (fastest healthy node is preferred) and optional paid key |
+| `ORDER_POLL_SEC` | 10 | Limit-order price check interval |
+| `SNIPE_POOL_WAIT_SEC` | 45 | How long the sniper waits for the pool after a deploy |
+| `MAX_WALLETS` / `MAX_ORDERS` / `MAX_SNIPE_TARGETS` / `MAX_COPY_TARGETS` | 10 / 20 / 10 / 10 | Per-user limits |
+| `BACKUP_TIME_UTC` | 00:17 | Daily database backup to admins |
+
+## Works with NEAR Analyzer
+
+[NEAR Analyzer Bot](https://github.com/LoveTon-crypto/near-analyzer-bot) ([@nearai_agent](https://t.me/nearai_agent)) is the research side: token scanner, wallet PnL, memepad MC / dip alerts and the [new deploys channel](https://t.me/neardeploys). NDBOT is the execution side. Each analyzer alert and scan has a **⚡ Buy on NDbot** button — a deep link `t.me/ndegen_bot?start=c<token>` that opens this bot straight on the token card, so a trader goes from signal to filled order in two taps. The deploys channel shows each dev's history; add a dev you like to the 🎯 sniper and the bot buys their next launch automatically.
+
+## Data sources
+
+NEAR RPC (FastNear, Intear, Lava, dRPC and other public nodes), Ref Finance and Ref DCL contracts, [Intear](https://intea.rs) events WebSocket (copytrade, new tokens), [neardata.xyz](https://neardata.xyz) blocks (deploy signer), DexScreener, GeckoTerminal, nearly.trade API.
+
+## Roadmap
+
+- Sniping by ticker / keyword and on first-pool creation for any token
+- Multi-wallet bundle buys
+- Trailing stop and DCA orders
+- Mini App with charts and portfolio view
