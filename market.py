@@ -553,6 +553,9 @@ def price_fmt(p: float) -> str:
     if p >= 1:
         return f"${p:,.4f}"
     from decimal import Decimal
+    p = float(p)  # np.float64 из matplotlib → обычный float (repr numpy-числа Decimal не понимает)
+    if p != p or p in (float("inf"), float("-inf")):
+        return "$0"
     s = format(Decimal(repr(p)), "f").split(".")[1] + "0" * 20  # repr: 0.0014 не превращается в 0.0013999…
     zeros = len(s) - len(s.lstrip("0"))
     digits = s[zeros:zeros + 4].rstrip("0") or "0"
