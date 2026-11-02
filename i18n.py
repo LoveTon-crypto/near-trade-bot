@@ -205,6 +205,9 @@ EN: dict[str, str] = {
     "Комиссия: ": "Fee: ", "</code> · рефералам ": "</code> · referrals ", "Баланс ": "Balance ", "Ключ выплат: ": "Payout key: ",
     "Собрано комиссий: <b>": "Fees collected: <b>", " Ⓝ</b> · ждут отправки ": " Ⓝ</b> · pending ", " · не дошли ": " · failed ",
     "Начислено рефералам: ": "Credited to referrers: ", " Ⓝ · выплачено ": " Ⓝ · paid ", " · <b>к выплате ": " · <b>owed ",
+    "💾 Бэкап базы · пользователей: ": "💾 Database backup · users: ", " · кошельков: ": " · wallets: ",
+    "Восстановление: распаковать в файл базы и запустить бота с тем же MASTER_KEY.":
+        "Restore: unpack into the database file and start the bot with the same MASTER_KEY.",
     "Чистый доход: <b>": "Net income: <b>", "Пользователей: ": "Users: ", " · пришли по рефке: ": " · via referral: ",
     " · сделок с комиссией: ": " · trades with fee: ",
     "⚠️ На кошельке меньше, чем должны рефералам — пополните или не выводите.":

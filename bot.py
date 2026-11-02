@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from datetime import time as dtime, timezone
 from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
@@ -1685,6 +1686,38 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+# ---------------------------------------------------------------- автобэкап базы
+# Раз в сутки (и по /backup) админам в личку приходит сжатая копия базы. Ключи кошельков внутри
+# зашифрованы MASTER_KEY, поэтому без него файл не даёт доступа к деньгам. MASTER_KEY храните отдельно, офлайн.
+BACKUP_UTC = os.getenv("BACKUP_TIME_UTC", "00:17")  # 03:17 по Минску
+
+
+async def send_backup(tg_bot, chats) -> None:
+    raw, users, wallets_n = db.snapshot()
+    name = time.strftime("ndbot-backup-%Y-%m-%d_%H%M.db.gz", time.gmtime())
+    cap = (f"💾 Бэкап базы · пользователей: {users} · кошельков: {wallets_n}\n"
+           f"Восстановление: распаковать в файл базы и запустить бота с тем же MASTER_KEY.")
+    for c in chats:
+        try:
+            await tg_bot.send_document(c, document=raw, filename=name, caption=cap,
+                                       disable_notification=True)
+        except Exception as e:
+            log.error("backup to %s: %s", c, str(e)[:200])
+
+
+async def backup_job(ctx: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_IDS:
+        await send_backup(ctx.bot, ADMIN_IDS)
+    else:
+        log.warning("backup: ADMIN_IDS не задан — бэкап некому отправить")
+
+
+async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    await send_backup(ctx.bot, [update.effective_user.id])
+
+
 # ---------------------------------------------------------------- поделиться PnL
 def hold_fmt(sec: float) -> str:
     sec = int(max(sec, 0))
@@ -2375,6 +2408,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_copy_cb, pattern=r"^ct:"))
     app.add_handler(CommandHandler("ref", show_ref))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CallbackQueryHandler(on_ref_cb, pattern=r"^rf:"))
     app.add_handler(CallbackQueryHandler(on_pnl_share, pattern=r"^pn:"))
     app.add_handler(CallbackQueryHandler(on_order_cb, pattern=r"^lo:"))
@@ -2390,6 +2424,8 @@ def main():
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_orders, interval=ORDER_POLL, first=20)
     app.job_queue.run_repeating(retry_fees, interval=120, first=60)
+    bh, bm = (int(x) for x in BACKUP_UTC.split(":"))
+    app.job_queue.run_daily(backup_job, time=dtime(bh, bm, tzinfo=timezone.utc))
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 

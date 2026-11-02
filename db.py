@@ -330,6 +330,25 @@ class DB:
         return self.c.execute("SELECT id, user_id, wallet_id, amount, tries FROM fees WHERE status='pending' AND tries<?",
                               (max_tries,)).fetchall()
 
+    def snapshot(self) -> tuple[bytes, int, int]:
+        """Целостная копия всей базы (sqlite backup API, можно на ходу) → (gzip, пользователей, кошельков)."""
+        import gzip, os, tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            dst = sqlite3.connect(tmp)
+            try:
+                self.c.backup(dst)
+                users = dst.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                wallets = dst.execute("SELECT COUNT(*) FROM wallets").fetchone()[0]
+            finally:
+                dst.close()
+            with open(tmp, "rb") as f:
+                raw = f.read()
+        finally:
+            os.remove(tmp)
+        return gzip.compress(raw, 6), users, wallets
+
     def fee_stats(self) -> dict:
         def tot(q, *a):
             return sum(int(x) for (x,) in self.c.execute(q, a))
