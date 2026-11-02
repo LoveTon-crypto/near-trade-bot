@@ -92,8 +92,9 @@ class Ref:
         if not ids:
             raise NoPool(token)
         best = None
-        for pid in ids[-12:]:
-            p = await self.rpc.view(REF, "get_pool", {"pool_id": pid})
+        recent = ids[-12:]
+        got = await asyncio.gather(*(self.rpc.view(REF, "get_pool", {"pool_id": pid}) for pid in recent))
+        for pid, p in zip(recent, got):
             toks, amts = p["token_account_ids"], [int(a) for a in p["amounts"]]
             if set(toks) != {WNEAR, token}:
                 continue  # перестраховка: проверяем состав пула прямо в контракте
@@ -150,8 +151,8 @@ class Ref:
         a, b = sorted([token, WNEAR])  # в DCL токены в id пула идут по алфавиту
         ids = [f"{a}|{b}|{fee}" for fee in DCL_FEES]
         ids += [pid for pid, other in self.dcl_by_token.get(token, []) if other == WNEAR and pid not in ids]
-        for pid in ids:
-            p = await self._dcl_info(pid)
+        infos = await asyncio.gather(*(self._dcl_info(pid) for pid in ids))  # все уровни комиссии сразу
+        for pid, p in zip(ids, infos):
             if not p or {p.get("token_x"), p.get("token_y")} != {token, WNEAR}:
                 continue
             wn = self._reserve(p, WNEAR)

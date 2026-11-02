@@ -710,10 +710,6 @@ def near_px(x: float) -> str:
 
 
 async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
-    meta = await ref.ft_metadata(token)
-    sym, dec = str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0)
-    tid = db.token_id(token, sym, dec)
-
     async def _route():
         try:
             return await ref.route(token)
@@ -727,7 +723,18 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
             log.info("market %s: %s", token, e)
             return None
 
-    route, c, usd_near = await asyncio.gather(_route(), _mkt(), near_usd())
+    # всё, что не зависит друг от друга, грузим одновременно
+    s = active_signer(uid)
+
+    async def _bals():
+        if not s:
+            return 0, 0
+        return await asyncio.gather(ref.ft_balance(token, s.account_id), ref.native_balance(s.account_id))
+
+    meta, route, c, usd_near, (bal, near_bal) = await asyncio.gather(ref.ft_metadata(token), _route(), _mkt(),
+                                                                      near_usd(), _bals())
+    sym, dec = str(meta.get("symbol") or "?")[:20], int(meta.get("decimals") or 0)
+    tid = db.token_id(token, sym, dec)
     name = (c.name if c and c.name != "?" else meta.get("name")) or ""
     ch = (c.chg.get("h24") if c else None)
     head = f"<b>${esc(sym)}</b> · {esc(str(name)[:32])}"
@@ -771,10 +778,8 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     else:
         lines.append("⚠️ Пула с NEAR нет ни на Ref, ни на Ref DCL. Токены JustHoot до миграции пока не поддерживаются.")
 
-    s = active_signer(uid)
     has_pos = False
     if s:
-        bal = await ref.ft_balance(token, s.account_id)
         if bal:
             has_pos = db.totals(s.account_id, token)[0] > 0
             lines.append("")
@@ -796,7 +801,7 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
             except (NoPool, RpcError):
                 pass
         lines.append("")
-        lines.append(f"👛 {esc(short(s.account_id))} · {fmt_near(await ref.native_balance(s.account_id))} Ⓝ · "
+        lines.append(f"👛 {esc(short(s.account_id))} · {fmt_near(near_bal)} Ⓝ · "
                      f"⚙️ слиппедж {slippage_bps(uid) / 100:g}%")
     if c and c.links:
         lines.append("")

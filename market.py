@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
@@ -142,7 +143,8 @@ class Scanner:
         self._gt_pool: dict[str, str | None] = {}       # токен -> пул GeckoTerminal (кэш)
         self._chart_cache: dict[str, tuple[float, list]] = {}
         self._ath_cache: dict[str, tuple[float, float]] = {}     # токен -> (время, макс. цена)
-        self._dcl_cache: dict[str, tuple[float, str | None]] = {}  # токен -> (время, pool_id DCL или None)
+        self._dcl_cache: dict[str, tuple[float, str | None]] = {}
+        self._ath_busy: set[str] = set()  # токен -> (время, pool_id DCL или None)
         self._near_px: tuple[float, float] | None = None
         self._meta: dict[str, tuple[float, dict, int]] = {}
         self._nearly: dict[str, tuple[float, dict]] = {}       # токен -> (время, /api/launch)   # токен -> (время, ft_metadata, supply_raw)
@@ -199,19 +201,22 @@ class Scanner:
 
     async def card(self, address: str, with_chart: bool = True, with_holders: bool = True) -> TokenCard | None:
         c = TokenCard(address=address)
-        meta = await self._view(address, "ft_metadata")
+        # независимые запросы — параллельно (раньше шли по очереди и карточка ждала каждый)
+        meta, supply, _, _ = await asyncio.gather(
+            self._view(address, "ft_metadata"), self._view(address, "ft_total_supply"),
+            self._fill_market(c), self._gt_pool_of(address) if with_chart else asyncio.sleep(0))
         if not isinstance(meta, dict):
             return None
         c.name = str(meta.get("name") or "?")[:60]
         c.symbol = str(meta.get("symbol") or "?")[:20]
         c.decimals = int(f(meta.get("decimals")))
-        supply = await self._view(address, "ft_total_supply")
         try:
             c.supply_raw = int(supply)
         except (TypeError, ValueError):
             c.supply_raw = 0
+        if c.price and not c.fdv:
+            c.fdv = c.price * c.supply
 
-        await self._fill_market(c)
         if not c.price and c.address.endswith(".nearlytrade.near"):
             await self._fill_nearly(c)
         if not c.price:
@@ -466,14 +471,24 @@ class Scanner:
         pools = [r for r in rows if r[2]][:2]
         c.holders = people + pools
 
+    async def _gt_pool_of(self, address: str):
+        if address in self._gt_pool:
+            return
+        data = await self._json("GET", f"{GECKO}/networks/near/tokens/{address}/pools", params={"page": 1})
+        pools = (data or {}).get("data") or []
+        try:
+            self._gt_pool[address] = pools[0]["attributes"]["address"] if pools else None
+        except (KeyError, TypeError):
+            self._gt_pool[address] = None
+
+    async def _long_ath(self, address: str, pool: str):
+        data = await self._json("GET", f"{GECKO}/networks/near/pools/{pool}/ohlcv/hour",
+                                params={"aggregate": 4, "limit": 1000, "currency": "usd", "token": address})
+        rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+        self._ath_cache[address] = (time.time(), max((float(row[2]) for row in rows if len(row) >= 6), default=0.0))
+
     async def _fill_chart(self, c: TokenCard):
-        if c.address not in self._gt_pool:
-            data = await self._json("GET", f"{GECKO}/networks/near/tokens/{c.address}/pools", params={"page": 1})
-            pools = (data or {}).get("data") or []
-            try:
-                self._gt_pool[c.address] = pools[0]["attributes"]["address"] if pools else None
-            except (KeyError, TypeError):
-                self._gt_pool[c.address] = None
+        await self._gt_pool_of(c.address)
         pool = self._gt_pool.get(c.address)
         if not pool:  # пула нет или запрос не прошёл — проверим снова при следующем скане
             self._gt_pool.pop(c.address, None)
@@ -497,15 +512,14 @@ class Scanner:
             self._chart_cache[c.address] = (time.time(), c.candles)
         ath_price = max((r[2] for r in c.candles), default=0.0)
         cached_ath = self._ath_cache.get(c.address)
-        if cached_ath and time.time() - cached_ath[0] < 600:
+        if cached_ath:
             ath_price = max(ath_price, cached_ath[1])
-        else:  # 4-часовые свечи примерно за полгода — для ATH
-            data = await self._json("GET", f"{GECKO}/networks/near/pools/{pool}/ohlcv/hour",
-                                    params={"aggregate": 4, "limit": 1000, "currency": "usd", "token": c.address})
-            rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
-            long_max = max((float(row[2]) for row in rows if len(row) >= 6), default=0.0)
-            self._ath_cache[c.address] = (time.time(), long_max)
-            ath_price = max(ath_price, long_max)
+        if not cached_ath or time.time() - cached_ath[0] >= 600:
+            # ATH за полгода (4-часовые свечи) — тяжёлый запрос: не ждём его, он догрузится к следующему открытию
+            if c.address not in self._ath_busy:
+                self._ath_busy.add(c.address)
+                t = asyncio.create_task(self._long_ath(c.address, pool))
+                t.add_done_callback(lambda _t, a=c.address: self._ath_busy.discard(a))
         if ath_price and c.supply:
             c.ath_mcap = max(ath_price * c.supply, c.fdv)
 
