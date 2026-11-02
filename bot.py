@@ -728,9 +728,8 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
     name = (c.name if c and c.name != "?" else meta.get("name")) or ""
     ch = (c.chg.get("h24") if c else None)
     head = f"<b>${esc(sym)}</b> · {esc(str(name)[:32])}"
-    if ch is not None:
-        head += f" | {'🟢' if ch >= 0 else '🔴'} {ch:+.2f}% за 24ч"
-    lines = [head, f"<code>{esc(token)}</code>"]
+    head_24h = f" | {'🟢' if ch >= 0 else '🔴'} {ch:+.2f}% за 24ч" if ch is not None else ""
+    lines = [head + head_24h, f"<code>{esc(token)}</code>"]  # при открытой позиции вместо 24ч будет PnL %
     pad = "nearly" if token.endswith(".nearlytrade.near") else ("justhoot" if "justhoot" in token else "")
     links = [f'<a href="https://dexscreener.com/near/{esc(token)}">DS</a>',
              f'<a href="https://nearblocks.io/token/{esc(token)}">Nearblocks</a>']
@@ -788,8 +787,9 @@ async def token_card(uid: int, token: str) -> tuple[str, KB, bytes | None]:
                 lines.append(f"💰 Текущая стоимость: <b>{fmt_near(val)} Ⓝ</b>{u(val)}")
                 if spent:
                     pnl = got + val - spent
-                    lines.append(f"{'📈' if pnl >= 0 else '📉'} PnL: <b>{'+' if pnl >= 0 else '−'}{fmt_near(abs(pnl))} Ⓝ</b> "
-                                 f"({pnl / spent * 100:+.1f}%)")
+                    lines.append(f"{'📈' if pnl >= 0 else '📉'} PnL: <b>{'+' if pnl >= 0 else '−'}{fmt_near(abs(pnl))} Ⓝ</b>"
+                                 + (f" (${abs(pnl) / YOCTO * usd_near:,.2f})" if usd_near else ""))
+                    lines[0] = head + f" | {'🟢' if pnl >= 0 else '🔴'} PnL {pnl / spent * 100:+.2f}%"
             except (NoPool, RpcError):
                 pass
         lines.append("")
