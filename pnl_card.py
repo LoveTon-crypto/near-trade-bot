@@ -81,12 +81,40 @@ def builtin_character(win: bool, rng: random.Random, size: int = 720) -> Image.I
     return Image.open(buf).convert("RGBA")
 
 
-def character(win: bool, rng: random.Random) -> Image.Image:
+def rounded(img: Image.Image, radius: int = 48) -> Image.Image:
+    """Картинка без прозрачности (фото, скрин) — скругляем углы и добавляем рамку, чтобы смотрелась как стикер."""
+    img = img.convert("RGBA")
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, img.width - 1, img.height - 1), radius=radius, fill=255)
+    img.putalpha(mask)
+    frame = Image.new("RGBA", (img.width + 16, img.height + 16), (0, 0, 0, 0))
+    ImageDraw.Draw(frame).rounded_rectangle((0, 0, frame.width - 1, frame.height - 1), radius=radius + 8,
+                                            fill=(255, 255, 255, 230))
+    frame.alpha_composite(img, (8, 8))
+    return frame
+
+
+def open_pic(path: str) -> Image.Image:
+    img = Image.open(path)
+    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+    if has_alpha:
+        img = img.convert("RGBA")
+        if img.getextrema()[3][0] < 250:  # реально есть прозрачные пиксели
+            return img
+    return rounded(img.convert("RGB"))
+
+
+def character(win: bool, rng: random.Random, user_pics: list[str] | None = None, only_user: bool = False) -> Image.Image:
+    """Картинка пользователя → общие картинки бота (pnl_images) → встроенные персонажи."""
+    if user_pics and (only_user or rng.random() < 0.85):
+        try:
+            return open_pic(rng.choice(user_pics))
+        except Exception:
+            pass
     pics = pnl_art.custom_images(win)
-    # свои картинки в приоритете: если они есть, встроенные выпадают реже
     if pics and rng.random() < 0.8:
         try:
-            return Image.open(rng.choice(pics)).convert("RGBA")
+            return open_pic(rng.choice(pics))
         except Exception:
             pass
     return builtin_character(win, rng)
@@ -129,7 +157,8 @@ def fmt_amount(v: float) -> str:
 
 
 def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref_code: str,
-           brand: str = "NDBOT", hide: bool = False, seed: int | None = None) -> bytes:
+           brand: str = "NDBOT", hide: bool = False, seed: int | None = None,
+           user_pics: dict | None = None, only_user: bool = False) -> bytes:
     rng = random.Random(seed)
     win = pct >= 0
     t = THEME[win]
@@ -141,7 +170,7 @@ def render(symbol: str, pct: float, initial: float, worth: float, hold: str, ref
     d.text((70 + d.textlength(brand[:2], font=font(64)), 52), brand[2:], font=font(64), fill=t["logo"])
 
     # character (left)
-    ch = fit(character(win, rng), 600, 660)
+    ch = fit(character(win, rng, (user_pics or {}).get(win), only_user), 600, 660)
     img.alpha_composite(ch, (int(360 - ch.width / 2), int(H - 40 - ch.height)))
     d = ImageDraw.Draw(img)
 

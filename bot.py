@@ -9,6 +9,7 @@ import asyncio
 import contextvars
 import html
 import inspect
+import io
 import logging
 import os
 import re
@@ -1729,7 +1730,7 @@ async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     code = db.ref_code(uid)
     link = buy_link(ctx.bot.username, uid, tid)
     png = await asyncio.to_thread(pnl_card.render, sym or "?", pct, spent / YOCTO, worth / YOCTO, hold, code,
-                                  "NDBOT", hide)
+                                  "NDBOT", hide, None, user_pics(uid), db.get(f"u{uid}:pics_only", False))
     caption = (f"🤝 Делись с друзьями и получай до {REF_SHARES[0] if REF_SHARES else 0}% комиссий!\n"
                f"└ 🔗 {esc(link)}")
     share_text = (f"${sym} {pct:+.1f}% on NDbot 🚀 Buy it in one tap:" if lang_of(uid) == "en"
@@ -1742,6 +1743,110 @@ async def on_pnl_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_media(InputMediaPhoto(png, caption=caption, parse_mode=ParseMode.HTML), reply_markup=kb)
     else:
         await q.message.chat.send_photo(png, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ---------------------------------------------------------------- свои картинки для PnL (у каждого пользователя свои)
+USER_PICS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_pnl")
+MAX_USER_PICS = int(os.getenv("MAX_USER_PICS", "5"))
+MAX_PIC_BYTES = 8 * 1024 * 1024
+
+
+def user_pic_dir(uid: int, win: bool) -> str:
+    return os.path.join(USER_PICS_DIR, str(int(uid)), "win" if win else "loss")
+
+
+def user_pics(uid: int) -> dict:
+    out = {}
+    for win in (True, False):
+        d = user_pic_dir(uid, win)
+        out[win] = sorted(os.path.join(d, f) for f in os.listdir(d)) if os.path.isdir(d) else []
+    return out
+
+
+def pics_view(uid: int) -> tuple[str, KB]:
+    p = user_pics(uid)
+    only = db.get(f"u{uid}:pics_only", False)
+    text = ("🖼 <b>Мои PnL-картинки</b>\n\nЗагрузите свои картинки — они будут на ваших PnL-карточках "
+            "(видны только в ваших карточках).\nЛучше всего — PNG с прозрачным фоном, отправленный файлом; "
+            "обычные фото тоже подойдут.\n\n"
+            f"📈 Для профита: <b>{len(p[True])}/{MAX_USER_PICS}</b>\n📉 Для минуса: <b>{len(p[False])}/{MAX_USER_PICS}</b>")
+    kb = KB([[B("➕ Для профита", callback_data="pi:add:w"), B("➕ Для минуса", callback_data="pi:add:l")],
+             [B("✅ Только мои картинки" if only else "🔀 Мои + стандартные", callback_data="pi:mode")],
+             [B("🗑 Удалить мои картинки", callback_data="pi:del")]])
+    return text, kb
+
+
+async def on_pics_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = q.data.split(":")
+    act = parts[1]
+    if act == "add":
+        win = parts[2] == "w"
+        if len(user_pics(uid)[win]) >= MAX_USER_PICS:
+            await q.answer(f"Максимум {MAX_USER_PICS} картинок — удалите старые", show_alert=True)
+            return
+        await q.answer()
+        ctx.user_data["await"] = ("pnl_pic", win)
+        await q.message.chat.send_message(
+            "Пришлите картинку " + ("для профита 📈" if win else "для минуса 📉")
+            + " — фото или файлом (PNG с прозрачным фоном выглядит лучше всего).",
+            reply_markup=KB([[B("🚫 Отмена", callback_data="lo:pc")]]))
+        return
+    if act == "mode":
+        db.set(f"u{uid}:pics_only", not db.get(f"u{uid}:pics_only", False))
+        await q.answer("Сохранено")
+    elif act == "del":
+        import shutil
+        shutil.rmtree(os.path.join(USER_PICS_DIR, str(int(uid))), ignore_errors=True)
+        await q.answer("Удалено")
+    else:
+        await q.answer()
+    await edit_or_send(q, *pics_view(uid))
+
+
+def _save_pic(raw: bytes, path: str):
+    from PIL import Image
+    img = Image.open(io.BytesIO(raw))
+    img.load()
+    if img.width * img.height > 40_000_000:
+        raise ValueError("слишком большое изображение")
+    img = img.convert("RGBA") if (img.mode in ("RGBA", "LA", "P")) else img.convert("RGB")
+    img.thumbnail((900, 900))
+    img.save(path, format="PNG")
+
+
+async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    pending = ctx.user_data.get("await")
+    if not pending or pending[0] != "pnl_pic":
+        return
+    msg = update.message
+    if msg.document:
+        if not (msg.document.mime_type or "").startswith("image/") or (msg.document.file_size or 0) > MAX_PIC_BYTES:
+            await msg.reply_text("❌ Нужна картинка (PNG, JPG или WEBP) до 8 МБ.")
+            return
+        f = await msg.document.get_file()
+    elif msg.photo:
+        f = await msg.photo[-1].get_file()
+    else:
+        return
+    ctx.user_data.pop("await", None)
+    win = pending[1]
+    d = user_pic_dir(uid, win)
+    os.makedirs(d, exist_ok=True)
+    if len(os.listdir(d)) >= MAX_USER_PICS:
+        await msg.reply_text(f"Максимум {MAX_USER_PICS} картинок — удалите старые.")
+        return
+    raw = bytes(await f.download_as_bytearray())
+    path = os.path.join(d, f"{int(time.time() * 1000)}.png")
+    try:
+        await asyncio.to_thread(_save_pic, raw, path)
+    except Exception:
+        await msg.reply_text("❌ Не получилось открыть картинку. Попробуйте другой файл.")
+        return
+    text, kb = pics_view(uid)
+    await msg.reply_text("✅ Картинка добавлена.\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ---------------------------------------------------------------- позиции
@@ -1783,6 +1888,7 @@ def settings_kb(uid: int):
     cur = slippage_bps(uid)
     row = [B(("✅ " if cur == v else "") + f"{v / 100:g}%", callback_data=f"sl:{v}") for v in (100, 300, 500, 1000, 2000, 3000)]
     return KB([row[:3], row[3:], [B("✏️ Пресеты покупки: " + " / ".join(presets(uid)), callback_data="pr")],
+               [B("🖼 Мои PnL-картинки", callback_data="pi:v")],
                [B("🌐 Язык: Русский", callback_data="lang")]])
 
 
@@ -1938,6 +2044,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_trade_cb, pattern=r"^(b|bx|s|sx|c):"))
     app.add_handler(CallbackQueryHandler(on_settings_cb, pattern=r"^(sl:|pr$|lang$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_media))
+    app.add_handler(CallbackQueryHandler(on_pics_cb, pattern=r"^pi:"))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_orders, interval=ORDER_POLL, first=20)
     app.job_queue.run_repeating(retry_fees, interval=120, first=60)

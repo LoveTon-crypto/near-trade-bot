@@ -242,6 +242,23 @@ EN: dict[str, str] = {
     "Чтобы купить токен, создайте кошелёк — это займёт секунду:": "To buy this token, create a wallet — it takes a second:",
     " в NDbot 🚀 Купить в один клик:": " on NDbot 🚀 Buy it in one tap:",
 
+    # own PnL pictures
+    "🖼 Мои PnL-картинки": "🖼 My PnL pictures", "🖼 <b>Мои PnL-картинки</b>": "🖼 <b>My PnL pictures</b>",
+    "Загрузите свои картинки — они будут на ваших PnL-карточках (видны только в ваших карточках).":
+        "Upload your own pictures for your PnL cards (they appear only on your cards).",
+    "Лучше всего — PNG с прозрачным фоном, отправленный файлом; обычные фото тоже подойдут.":
+        "A PNG with a transparent background sent as a file looks best; regular photos work too.",
+    "📈 Для профита: <b>": "📈 For profit: <b>", "📉 Для минуса: <b>": "📉 For loss: <b>",
+    "➕ Для профита": "➕ For profit", "➕ Для минуса": "➕ For loss",
+    "✅ Только мои картинки": "✅ Only my pictures", "🔀 Мои + стандартные": "🔀 Mine + standard",
+    "🗑 Удалить мои картинки": "🗑 Delete my pictures", " картинок — удалите старые": " pictures — delete old ones",
+    " картинок — удалите старые.": " pictures — delete old ones.", "Пришлите картинку ": "Send a picture ",
+    "для профита 📈": "for profit 📈", "для минуса 📉": "for loss 📉",
+    " — фото или файлом (PNG с прозрачным фоном выглядит лучше всего).": " — as a photo or a file (a transparent PNG looks best).",
+    "Удалено": "Deleted", "❌ Нужна картинка (PNG, JPG или WEBP) до 8 МБ.": "❌ Send an image (PNG, JPG or WEBP) up to 8 MB.",
+    "❌ Не получилось открыть картинку. Попробуйте другой файл.": "❌ Couldn't open the picture. Try another file.",
+    "✅ Картинка добавлена.": "✅ Picture added.", "слишком большое изображение": "image is too large",
+
     # language switch
     "🌐 Язык: Русский": "🌐 Language: English", "✅ Язык: русский": "✅ Language: English",
 }
