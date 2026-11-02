@@ -279,7 +279,8 @@ class Ref:
         while True:
             try:
                 if not await self._registered(token, s.account_id):
-                    await self._register(s, token)
+                    # ждём только включения в блок: свап до токена дойдёт на несколько блоков позже регистрации
+                    await self._register(s, token, wait="INCLUDED")
                 return
             except (RpcError, TxFailed) as e:
                 if "большой storage" in str(e) or time.time() > deadline:

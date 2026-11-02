@@ -2352,7 +2352,7 @@ async def run_snipe(t: dict, token: str, pad: str, deploy_tx: str, tm: dict | No
             raise
         mark("pool")
         try:
-            await asyncio.wait_for(asyncio.shield(prep), 2.5)
+            await asyncio.wait_for(asyncio.shield(prep), 1.5)
             mark("storage")
         except Exception as e:
             log.info("snipe storage %s: %s", token, str(e)[:120])
