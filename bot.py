@@ -55,7 +55,7 @@ SECRET_TTL = int(os.getenv("SECRET_MESSAGE_TTL", "120"))
 # начисляются пригласившим. Реферальный доход выплачивается с FEE_ACCOUNT (ключ задаётся через admin.py).
 FEE_BPS = int(os.getenv("FEE_BPS", "100"))
 FEE_ACCOUNT = os.getenv("FEE_ACCOUNT", "buddhadefi-hot.tg").strip().lower()
-REF_SHARES = [int(x) for x in os.getenv("REF_SHARES", "30,10,5").split(",") if x.strip()]
+REF_SHARES = [int(x) for x in os.getenv("REF_SHARES", "30,5,3").split(",") if x.strip()]
 REF_MIN_WITHDRAW = to_yocto(os.getenv("REF_MIN_WITHDRAW_NEAR", "0.1"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}  # сек, через сколько удалять сообщения с ключами
 

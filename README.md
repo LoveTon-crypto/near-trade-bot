@@ -25,7 +25,7 @@ Memecoins on NEAR launch on memepads (**nearly.trade**, **JustHoot**) and trade 
 | 🔁 **Copytrade** | Mirror any wallet in real time: fixed amount or % of the leader's trade with a cap, min leader trade filter, sells copied as the same share of the position. Multi-hop swaps are merged into one net trade; stale or missed trades are never copied |
 | 📋 **Limit orders** | Buy the dip / breakout, take-profit, stop-loss — target in NEAR price, $ price, % or market cap. Checked every 10 s; when a position is fully closed, the remaining sell orders for it are cancelled |
 | 🖼 **PnL cards** | After every sell (manual, order, copytrade) the bot sends a share-ready PnL card with the user's referral link; random characters with a green/red chart, or the user's own uploaded pictures |
-| 🤝 **3-level referrals** | Each user gets a referral link; inviters earn a share of the bot fee from 3 levels (30 / 10 / 5 %) and withdraw it to their wallet in one tap |
+| 🤝 **3-level referrals** | Each user gets a referral link; inviters earn a share of the bot fee from 3 levels (30 / 5 / 3 %) and withdraw it to their wallet in one tap |
 | 📈 **Positions** | All tokens on the active wallet with value in NEAR and PnL |
 | 🌐 **EN / RU** | Language follows Telegram, switchable in settings |
 | 🛠 **Admin** | `/admin` — fees, referral liabilities, payout wallet; `/rpc` — RPC node health; `/backup` + daily automatic database backup to the admins' Telegram |
@@ -96,7 +96,7 @@ venv/bin/python tests/test_i18n.py      # every user-facing Russian string has a
 | `MASTER_KEY` | — | 32-byte base64 vault key. **Back it up offline** — without it no wallet in the database can be opened |
 | `ADMIN_IDS` | — | Telegram ids allowed to use `/admin`, `/rpc`, `/backup` |
 | `MAX_BUY_NEAR` / `GAS_RESERVE_NEAR` | 100 / 0.1 | Per-buy cap and NEAR kept for gas |
-| `FEE_BPS` / `FEE_ACCOUNT` / `REF_SHARES` | 100 / … / 30,10,5 | Bot fee, fee wallet, referral shares per level |
+| `FEE_BPS` / `FEE_ACCOUNT` / `REF_SHARES` | 100 / … / 30,5,3 | Bot fee, fee wallet, referral shares per level |
 | `RPC_URLS` / `FASTNEAR_API_KEY` | free public nodes | RPC list (fastest healthy node is preferred) and optional paid key |
 | `ORDER_POLL_SEC` | 10 | Limit-order price check interval |
 | `SNIPE_POOL_WAIT_SEC` | 45 | How long the sniper waits for the pool after a deploy |
