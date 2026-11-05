@@ -1622,6 +1622,7 @@ async def ref_view(uid: int, bot_username: str) -> tuple[str, KB]:
     share = "https://t.me/share/url?url=" + link.replace(":", "%3A").replace("/", "%2F").replace("?", "%3F").replace("=", "%3D")
     kb = KB([[B("📤 Поделиться ссылкой", url=share)],
              [B(f"💸 Вывод (от {fmt_near(REF_MIN_WITHDRAW)} Ⓝ)", callback_data="rf:w")],
+             [B("✏️ Изменить ссылку", callback_data="rf:n")],
              [B("🔄 Обновить", callback_data="rf:r")]])
     return "\n".join(lines), kb
 
@@ -1638,6 +1639,15 @@ async def on_ref_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.data == "rf:r":
         await q.answer("Обновлено")
         await edit_or_send(q, *await ref_view(uid, ctx.bot.username))
+        return
+    if q.data == "rf:n":
+        await q.answer()
+        ctx.user_data["await"] = ("refname",)
+        await q.message.chat.send_message(
+            "✏️ Отправьте новое имя для ссылки: 3–20 латинских букв, цифр или «-».\n"
+            f"Например <code>cryptoworld</code> → <code>t.me/{ctx.bot.username}?start=rcryptoworld</code>\n"
+            "Старая ссылка продолжит работать.",
+            parse_mode=ParseMode.HTML, reply_markup=KB([[B("Отмена", callback_data="w:x:0")]]))
         return
     if q.data == "rf:w":
         bal = db.ref_balance(uid)
@@ -2683,6 +2693,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kind = pending[0]
         if kind == "import":
             await import_secret(update, ctx, text)
+        elif kind == "refname":
+            res = db.set_ref_code(uid, text.strip().lstrip("@"))
+            if res == "ok":
+                await update.message.reply_text("✅ Ссылка изменена.")
+                await show_ref(update, ctx)
+                return
+            ctx.user_data["await"] = ("refname",)
+            await update.message.reply_text("❌ Это имя уже занято, попробуйте другое." if res == "taken" else
+                                            "❌ Только латинские буквы, цифры и «-», от 3 до 20 символов.",
+                                            reply_markup=KB([[B("Отмена", callback_data="w:x:0")]]))
         elif kind == "rename":
             name = " ".join(text.split())[:24]
             if not name:

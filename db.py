@@ -253,8 +253,28 @@ class DB:
                 continue
 
     def user_by_code(self, code: str) -> int | None:
-        r = self.c.execute("SELECT id FROM users WHERE ref_code=?", (code,)).fetchone()
+        """Текущий код (в любом регистре) или старый, от которого пользователь ушёл, — старые ссылки работают."""
+        self.c.execute("CREATE TABLE IF NOT EXISTS ref_aliases (code TEXT PRIMARY KEY COLLATE NOCASE, user_id INTEGER)")
+        r = self.c.execute("SELECT id FROM users WHERE ref_code=? COLLATE NOCASE", (code,)).fetchone() or \
+            self.c.execute("SELECT user_id FROM ref_aliases WHERE code=? COLLATE NOCASE", (code,)).fetchone()
         return r[0] if r else None
+
+    def set_ref_code(self, uid: int, code: str) -> str:
+        """'ok' | 'bad' | 'taken'. Код: 3–20 латинских букв, цифр или «-» (без «_»: им в ссылках отделяется токен)."""
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9-]{3,20}", code or "") or code.startswith("-"):
+            return "bad"
+        owner = self.user_by_code(code)
+        if owner is not None and owner != uid:
+            return "taken"
+        old = self.ref_code(uid)
+        if old == code:
+            return "ok"
+        self.c.execute("INSERT OR IGNORE INTO ref_aliases (code, user_id) VALUES (?, ?)", (old, uid))
+        self.c.execute("DELETE FROM ref_aliases WHERE code=? COLLATE NOCASE AND user_id=?", (code, uid))
+        self.c.execute("UPDATE users SET ref_code=? WHERE id=?", (code, uid))
+        self.c.commit()
+        return "ok"
 
     def referrer(self, uid: int) -> int | None:
         r = self.c.execute("SELECT referrer FROM users WHERE id=?", (uid,)).fetchone()
